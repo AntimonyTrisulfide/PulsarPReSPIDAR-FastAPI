@@ -13,11 +13,11 @@ RUN apt-get update \
 WORKDIR /app
 
 # Install Python dependencies before copying the rest of the app for better layer caching
-COPY app/requirements.txt /tmp/requirements.txt
+COPY requirements.txt /tmp/requirements.txt
 RUN pip install --no-cache-dir -r /tmp/requirements.txt
 
 # Copy FastAPI source code
-COPY app /app
+COPY . /app
 
 # Copy pre-downloaded model artifacts (downloaded in CI before docker build)
 ENV MODEL_DIR=/models
