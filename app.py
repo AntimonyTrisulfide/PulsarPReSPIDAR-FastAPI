@@ -1,196 +1,214 @@
-from fastapi import FastAPI, UploadFile, File, Form
+from fastapi import FastAPI
+from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
-from fastapi.responses import JSONResponse
-import torch
-import torchaudio
-import pathlib
 import io
-import shutil
-import traceback
-import uuid
-from typing import Optional
-from app.model import UNet
-from app.processor import ExternalPreprocessedDataset, ExternalPreprocessor
+import numpy as np
+from test import plot_poincare_aitoff_at_phase, return_xyz_interactive_poincare_sphere
+from test import get_all_profiles
+from test import plot_all_heatmaps
+from test import (
+    plot_phase_slice_histograms_by_phase,
+    polarisation_histogram_single,
+    build_polarisation_payload,
+)
+from test import plot_polarisation_stacks
+from fastapi.responses import JSONResponse
+import asyncio
+from functools import lru_cache
+import hashlib
 
-app = FastAPI()
-
-allowed_origins = [
-    "http://127.0.0.1:5173",
-    "http://localhost:5173",
-    "http://127.0.0.1:5000",
-    "http://localhost:5000",
-]
+app = FastAPI(title="Pulsar Polarimetry API")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=allowed_origins,
+    allow_origins=["*"],  # Or specify your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ----------------------------- Static Files Setup ----------------------------- #
-OUTPUT_DIR = pathlib.Path("reconstructed_audio")
-OUTPUT_DIR.mkdir(exist_ok=True)
-PUBLIC_BASE_URL = "http://127.0.0.1:8001"
-app.mount("/output", StaticFiles(directory=OUTPUT_DIR), name="output")
+# Helper function to load numpy data
+async def load_numpy_data(file: UploadFile):
+    """Load and parse numpy file asynchronously"""
+    content = await file.read()
+    # Run CPU-intensive np.load in thread pool
+    data = await asyncio.to_thread(np.load, io.BytesIO(content))
+    if isinstance(data, np.lib.npyio.NpzFile):
+        key = list(data.keys())[0]
+        data = data[key]
+    return data
 
-# ----------------------------- Model Setup ----------------------------- #
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = UNet(in_channels=1, out_channels=16).to(device)
+@app.get("/", summary="Health check")
+async def root() -> dict[str, str]:
+    return {"status": "ok"}
 
-model_path = pathlib.Path("app/model_weights.pth")
-model.load_state_dict(torch.load(model_path, map_location=device))
-model.eval()
+@app.post("/export_poincare_data", summary="Fetch pulsar details")
+async def export_poincare_data(file: UploadFile = File(...), start_phase: float = 0.0, end_phase: float = 1.0, on_pulse_start: float = 0.0, on_pulse_end: float = 1.0):
+    # Load numpy file npz or npy
+    data = await load_numpy_data(file)
 
-# ----------------------------- Inference Logic ----------------------------- #
-def reconstruct_and_save_audio(model, dataset, preprocessor, save_dir=OUTPUT_DIR, device='cpu'):
-    import torchaudio.transforms as T
+    # Run computation in thread pool to avoid blocking
+    response = await asyncio.to_thread(
+        return_xyz_interactive_poincare_sphere,
+        data, start_phase, end_phase, (on_pulse_start, on_pulse_end), file.filename
+    )
+    return {"x": response[0].tolist(), "y": response[1].tolist(), "z": response[2].tolist()}
 
-    save_dir = pathlib.Path(save_dir)
-    save_dir.mkdir(exist_ok=True, parents=True)
+@app.post("/export_profiles", summary="Fetch profiles")
+async def export_profiles(file: UploadFile = File(...), start_phase: float = 0.0, end_phase: float = 1.0):
+    # Load numpy file npz or npy
+    data = await load_numpy_data(file)
 
-    track_urls = []  # Flat list retained for backward compatibility
-    track_payloads = []
+    # Get all profiles in one optimized call
+    profiles = await asyncio.to_thread(get_all_profiles, data, start_phase, end_phase)
+    
+    I_profile = {"x": profiles['I']['x'].tolist(), "y": profiles['I']['y'].tolist()}
+    Q_profile = {"x": profiles['Q']['x'].tolist(), "y": profiles['Q']['y'].tolist()}
+    U_profile = {"x": profiles['U']['x'].tolist(), "y": profiles['U']['y'].tolist()}
+    V_profile = {"x": profiles['V']['x'].tolist(), "y": profiles['V']['y'].tolist()}
 
-    for track_dir in dataset.track_dirs:
-        track_name = track_dir.name
-        track_output_dir = save_dir / track_name
-        track_output_dir.mkdir(exist_ok=True)
-        current_track_stems = []
+    return {"I": I_profile, "Q": Q_profile, "U": U_profile, "V": V_profile}
 
-        mix_data = torch.load(track_dir / 'mix.pt')
-        mix_specs = mix_data['spectrogram']
-        mix_phases = mix_data['phases']
-        n_chunks = mix_specs.shape[0]
+@app.post("/export_heatmaps", summary="Fetch heatmaps")
+async def export_heatmaps(file: UploadFile = File(...), start_phase: float = 0.0, end_phase: float = 1.0):
+    # Load numpy file npz or npy
+    data = await load_numpy_data(file)
 
-        reconstructed_sources = {name: [] for name in dataset.all_source_names}
-        istft = T.InverseSpectrogram(n_fft=preprocessor.n_fft, hop_length=preprocessor.hop_length)
+    obs_id = file.filename
 
-        for chunk_idx in range(n_chunks):
-            mix_spec_chunk = mix_specs[chunk_idx].unsqueeze(0).unsqueeze(0).to(device)
-            with torch.no_grad():
-                mask_logits = model(mix_spec_chunk)
-                masks = torch.sigmoid(mask_logits).squeeze(0).cpu()
+    # Compute all heatmaps in one efficient pass with async
+    heatmaps = await asyncio.to_thread(plot_all_heatmaps, data, start_phase, end_phase, obs_id)
+    
+    # Convert to JSON-serializable format
+    I_heatmap_data = {"pulse_phase": heatmaps['I']['pulse_phase'].tolist(), "pulse_number": heatmaps['I']['pulse_number'].tolist(), "heatmap_data": heatmaps['I']['heatmap_data'].tolist(), "vmin": heatmaps['I']['vmin'], "vmax": heatmaps['I']['vmax'], "label": heatmaps['I']['label'], "obs_id": heatmaps['I']['obs_id']}
+    Q_heatmap_data = {"pulse_phase": heatmaps['Q']['pulse_phase'].tolist(), "pulse_number": heatmaps['Q']['pulse_number'].tolist(), "heatmap_data": heatmaps['Q']['heatmap_data'].tolist(), "vmin": heatmaps['Q']['vmin'], "vmax": heatmaps['Q']['vmax'], "label": heatmaps['Q']['label'], "obs_id": heatmaps['Q']['obs_id']}
+    U_heatmap_data = {"pulse_phase": heatmaps['U']['pulse_phase'].tolist(), "pulse_number": heatmaps['U']['pulse_number'].tolist(), "heatmap_data": heatmaps['U']['heatmap_data'].tolist(), "vmin": heatmaps['U']['vmin'], "vmax": heatmaps['U']['vmax'], "label": heatmaps['U']['label'], "obs_id": heatmaps['U']['obs_id']}
+    V_heatmap_data = {"pulse_phase": heatmaps['V']['pulse_phase'].tolist(), "pulse_number": heatmaps['V']['pulse_number'].tolist(), "heatmap_data": heatmaps['V']['heatmap_data'].tolist(), "vmin": heatmaps['V']['vmin'], "vmax": heatmaps['V']['vmax'], "label": heatmaps['V']['label'], "obs_id": heatmaps['V']['obs_id']}
 
-            for src_idx, source_name in enumerate(dataset.all_source_names):
-                masked_spec = masks[src_idx] * mix_spec_chunk.squeeze().cpu()
-                phase = mix_phases[chunk_idx]
-                complex_spec = masked_spec * torch.exp(1j * phase)
-                reconstructed_audio = istft(complex_spec.unsqueeze(0)).squeeze(0)
-                reconstructed_sources[source_name].append(reconstructed_audio)
+    return {"I": I_heatmap_data, "Q": Q_heatmap_data, "U": U_heatmap_data, "V": V_heatmap_data}
 
-        for source_name, audio_chunks in reconstructed_sources.items():
-            full_audio = torch.cat(audio_chunks, dim=0)
-            save_path = track_output_dir / f"{source_name}_reconstructed.wav"
-            torchaudio.save(save_path, full_audio.unsqueeze(0), preprocessor.sr)
+@app.post("/poincare_sphere_aitoff_fixedphase", summary="Fetch Poincare sphere data for Aitoff projection with fixed phase value")
+async def poincare_sphere_aitoff_fixedphase(
+    file: UploadFile = File(...),
+    phase_value: float = 0.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    obs_id: str | None = None,
+):
+    data = await load_numpy_data(file)
 
-            # Build the public URL
-            url = f"{PUBLIC_BASE_URL}/output/{track_name}/{source_name}_reconstructed.wav"
-            track_urls.append(url)
-            current_track_stems.append({"name": source_name, "url": url})
+    on_pulse = (on_pulse_start, on_pulse_end)
+    lon_arr, lat_array = await asyncio.to_thread(
+        plot_poincare_aitoff_at_phase, data, on_pulse, phase_value, obs_id or "uploaded"
+    )
 
-        track_payloads.append({"cache_id": track_name, "stems": current_track_stems})
-
-    primary_track = track_payloads[0] if track_payloads else {"cache_id": None, "stems": []}
-
-    return {
-        "status": "success",
-        "cache_id": primary_track["cache_id"],
-        "files": track_urls,
-        "stems": primary_track["stems"],
-    }
-
-# ----------------------------- Inference Pipeline ----------------------------- #
-def inference_pipeline(temp_input_path, device, track_id):
-    output_dir_preprocessed = pathlib.Path("preprocessed_output")
-    output_dir_preprocessed.mkdir(exist_ok=True)
-
-    try:
-        preprocessor = ExternalPreprocessor(temp_input_path, output_dir_preprocessed)
-        track_output_dir = preprocessor.preprocess()
-
-        # Ensure the downstream track directory aligns with the requested cache identifier
-        if track_output_dir.name != track_id:
-            desired_dir = track_output_dir.parent / track_id
-            if desired_dir.exists():
-                shutil.rmtree(desired_dir, ignore_errors=True)
-            track_output_dir.rename(desired_dir)
-
-        source_names = [
-            'Bass', 'Brass', 'Chromatic Percussion', 'Drums', 'Ethnic',
-            'Guitar', 'Organ', 'Percussive', 'Piano', 'Pipe', 'Reed',
-            'Sound Effects', 'Strings', 'Strings (continued)',
-            'Synth Lead', 'Synth Pad'
-        ]
-
-        dataset = ExternalPreprocessedDataset(output_dir_preprocessed, source_names)
-        result = reconstruct_and_save_audio(model, dataset, preprocessor, device=device)
-        result["cache_id"] = track_id
-        return result
-
-    except Exception as e:
-        traceback.print_exc()
-        return {"status": "failed", "error": str(e)}
-
-    finally:
-        try:
-            if temp_input_path.exists():
-                temp_input_path.unlink()
-                print(f"🧹 Deleted temporary input file: {temp_input_path}")
-
-            if output_dir_preprocessed.exists():
-                shutil.rmtree(output_dir_preprocessed, ignore_errors=True)
-                print(f"🧹 Deleted preprocessed folder: {output_dir_preprocessed}")
-
-        except Exception as cleanup_error:
-            print(f"[Warning] Cleanup failed: {cleanup_error}")
-
-# ----------------------------- FastAPI Endpoint ----------------------------- #
-def build_cached_payload(track_id):
-    track_dir = OUTPUT_DIR / track_id
-    if not track_dir.exists():
-        return None
-
-    stems = []
-    for wav_file in sorted(track_dir.glob("*.wav")):
-        stem_name = wav_file.stem.replace("_reconstructed", "")
-        url = f"{PUBLIC_BASE_URL}/output/{track_id}/{wav_file.name}"
-        stems.append({"name": stem_name, "url": url})
-
-    if not stems:
-        return None
-
-    return {
-        "files": [stem["url"] for stem in stems],
-        "stems": stems,
-    }
+    return {"lon": lon_arr.tolist(), "lat": lat_array.tolist()}
 
 
-@app.post("/infer")
-async def infer_audio(file: UploadFile = File(...), cache_id: Optional[str] = Form(None)):
-    print("Received file:", file.filename if file else "No file")
-    if not file:
-        return {"error": "No file received"}
+@app.post("/phase_slice_histograms", summary="Phase-slice histograms for multiple polarisation quantities")
+async def phase_slice_histograms(
+    file: UploadFile = File(...),
+    left_phase: float = 0.0,
+    mid_phase: float = 0.5,
+    right_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    default_bins: int = 200,
+):
+    data = await load_numpy_data(file)
 
-    track_id = cache_id or uuid.uuid4().hex
+    on_pulse = (on_pulse_start, on_pulse_end)
+    payload = await asyncio.to_thread(
+        plot_phase_slice_histograms_by_phase,
+        data,
+        left_phase,
+        mid_phase,
+        right_phase,
+        on_pulse,
+        file.filename,
+        default_bins,
+        True,
+    )
 
-    if cache_id:
-        cached_payload = build_cached_payload(track_id)
-        if cached_payload:
-            return JSONResponse({
-                "status": "cached",
-                "cache_id": track_id,
-                **cached_payload,
-            })
+    return JSONResponse(content=payload)
 
-    input_bytes = await file.read()
-    print("File size:", len(input_bytes), "bytes")
-    input_audio, sr = torchaudio.load(io.BytesIO(input_bytes))
 
-    temp_input_path = pathlib.Path(f"{track_id}.wav")
-    torchaudio.save(temp_input_path, input_audio, sr)
+@app.post(
+    "/polarisation_preprocess",
+    summary="Preprocess Poincare-sphere coords and polarisation fractions/angles",
+)
+async def polarisation_preprocess(
+    file: UploadFile = File(...),
+    start_phase: float = 0.0,
+    end_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    max_pulses: int | None = None,
+):
+    data = await load_numpy_data(file)
 
-    result = inference_pipeline(temp_input_path, device, track_id)
-    return JSONResponse(result)
+    on_pulse = (on_pulse_start, on_pulse_end)
+    payload = await asyncio.to_thread(
+        build_polarisation_payload,
+        data,
+        start_phase,
+        end_phase,
+        on_pulse,
+        max_pulses,
+    )
+
+    return JSONResponse(content=payload)
+
+# One route that serves a single quantity; you can call it for each of the 8 quantities
+# quantity values: PA, EA, P/I, L/I, |V/I|, V/I, I, dPA
+@app.post("/polarisation_histogram", summary="Single polarisation histogram for one quantity")
+async def polarisation_histogram_single_endpoint(
+    quantity: str,
+    file: UploadFile = File(...),
+    start_phase: float = 0.0,
+    end_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    base_quantity_bins: int = 200,
+):
+    data = await load_numpy_data(file)
+
+    on_pulse = (on_pulse_start, on_pulse_end)
+    payload = await asyncio.to_thread(
+        polarisation_histogram_single,
+        data,
+        start_phase,
+        end_phase,
+        on_pulse,
+        file.filename,
+        quantity,
+        base_quantity_bins,
+    )
+
+    return JSONResponse(content=payload)
+
+
+@app.post("/polarisation_stacks", summary="Pulse-phase stacks for polarisation quantities")
+async def polarisation_stacks_endpoint(
+    file: UploadFile = File(...),
+    start_phase: float = 0.0,
+    end_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+):
+    data = await load_numpy_data(file)
+
+    on_pulse = (on_pulse_start, on_pulse_end)
+    payload = await asyncio.to_thread(
+        plot_polarisation_stacks,
+        data,
+        start_phase,
+        end_phase,
+        on_pulse,
+        file.filename,
+        True,
+    )
+
+    return JSONResponse(content=payload)
+
+
