@@ -1,6 +1,7 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Request
 from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import Response
 import io
 import numpy as np
 from test import plot_poincare_aitoff_at_phase, return_xyz_interactive_poincare_sphere
@@ -16,6 +17,7 @@ from fastapi.responses import JSONResponse
 import asyncio
 from functools import lru_cache
 import hashlib
+import httpx
 
 app = FastAPI(title="Pulsar Polarimetry API")
 
@@ -41,6 +43,37 @@ async def load_numpy_data(file: UploadFile):
 @app.get("/", summary="Health check")
 async def root() -> dict[str, str]:
     return {"status": "ok"}
+
+@app.get("/proxy", summary="Proxy requests to external servers")
+async def proxy_request(url: str, request: Request):
+    """
+    Proxy endpoint that forwards requests to external URLs (e.g., MeerTime server).
+    Accepts a url query parameter and forwards the authorization header.
+    """
+    if not url:
+        raise HTTPException(status_code=400, detail="URL parameter is required")
+    
+    # Extract authorization header from incoming request
+    auth_header = request.headers.get("authorization")
+    if not auth_header:
+        raise HTTPException(status_code=401, detail="Authorization header is required")
+    
+    headers = {"Authorization": auth_header}
+    
+    try:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            response = await client.get(url, headers=headers)
+            
+            # Forward the response back to the client
+            return Response(
+                content=response.content,
+                status_code=response.status_code,
+                headers=dict(response.headers)
+            )
+    except httpx.RequestError as e:
+        raise HTTPException(status_code=502, detail=f"Error connecting to remote server: {str(e)}")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Proxy error: {str(e)}")
 
 @app.post("/export_poincare_data", summary="Fetch pulsar details")
 async def export_poincare_data(file: UploadFile = File(...), start_phase: float = 0.0, end_phase: float = 1.0, on_pulse_start: float = 0.0, on_pulse_end: float = 1.0):

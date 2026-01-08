@@ -4,3 +4,4 @@ numpy
 matplotlib
 scipy
 python-multipart
+httpx
