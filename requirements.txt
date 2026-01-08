@@ -1,8 +1,6 @@
 fastapi
 uvicorn[standard]
-gunicorn
 numpy
 matplotlib
 scipy
 python-multipart
-httpx
