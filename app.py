@@ -36,7 +36,7 @@ Instrumentator().instrument(app).expose(app)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pulsar-p-re-spidar-react-js.vercel.app"],  # Or specify your frontend URL
+    allow_origins=["https://pulsar-p-re-spidar-react-js.vercel.app", "https://psrweb.jb.man.ac.uk"],  # Or specify your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
