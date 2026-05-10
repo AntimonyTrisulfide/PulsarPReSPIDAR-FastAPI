@@ -14,8 +14,8 @@ from test import (
     precompute_polarimetry,
     precompute_stokes,
 )
-from test import plot_polarisation_stacks
-from fastapi.responses import JSONResponse
+from test import iter_polarisation_stacks_json
+from fastapi.responses import JSONResponse, StreamingResponse
 import asyncio
 import hashlib
 import psutil
@@ -37,7 +37,7 @@ Instrumentator().instrument(app).expose(app)
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pulsar-p-re-spidar-react-js.vercel.app", "https://psrweb.jb.man.ac.uk"],  # Or specify your frontend URL
+    allow_origins=["https://pulsar-p-re-spidar-react-js.vercel.app", "https://psrweb.jb.man.ac.uk", "http://localhost:5173"],  # Or specify your frontend URL
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -475,15 +475,14 @@ async def polarisation_stacks_endpoint(
 ):
     on_pulse = (on_pulse_start, on_pulse_end)
     precomputed, _ = await load_polarimetry_precompute(file=file, on_pulse=on_pulse, data_key=data_key)
-    payload = await asyncio.to_thread(
-        plot_polarisation_stacks,
-        precomputed,
-        start_phase,
-        end_phase,
-        on_pulse,
-        _resolve_obs_id(file, data_key),
-        True,
+    return StreamingResponse(
+        iter_polarisation_stacks_json(
+            precomputed,
+            start_phase,
+            end_phase,
+            on_pulse,
+            _resolve_obs_id(file, data_key),
+        ),
+        media_type="application/json",
     )
-
-    return JSONResponse(content=payload)
 

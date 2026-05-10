@@ -1,4 +1,5 @@
 import numpy as np
+import json
 from dataclasses import dataclass
 
 DEBIAS_THRESHOLD = 1.57
@@ -687,7 +688,7 @@ def polarisation_histogram_single(data, start_phase, end_phase, on_pulse, obs_id
         "is_fraction": is_fraction,
         "quantity_bins": int(quantity_bins),
         "phase_axis": selected_phase_axis.tolist(),
-        "hist2d": hist2d.tolist(),
+        "hist2d": [],
         "log_hist2d": log_hist2d.tolist(),
         "bin_edges": bin_edges.tolist(),
         "bin_centers": bin_centers.tolist(),
@@ -736,6 +737,75 @@ def plot_polarisation_stacks(data, start_phase, end_phase, on_pulse, obs_id, ret
                 "vmax": float(q_max),
             })
         return payload
+
+
+def _json_row(row):
+    row = np.asarray(row)
+    if np.isfinite(row).all():
+        values = row.tolist()
+    else:
+        values = [float(value) if np.isfinite(value) else None for value in row]
+    return json.dumps(values, separators=(",", ":"), allow_nan=False)
+
+
+def _json_value(value):
+    if isinstance(value, (np.integer,)):
+        value = int(value)
+    elif isinstance(value, (np.floating,)):
+        value = float(value)
+    if isinstance(value, float) and not np.isfinite(value):
+        return None
+    return value
+
+
+def _json_dumps(value):
+    return json.dumps(value, separators=(",", ":"), allow_nan=False)
+
+
+def iter_polarisation_stacks_json(data, start_phase, end_phase, on_pulse, obs_id):
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
+    quantities = [params.PA_deg, params.EA_deg, params.p_frac, params.l_frac, params.abs_vfrac, params.v_frac]
+    labels = ["PA [deg]", "EA [deg]", "P/I", "L/I", "|V/I|", "V/I"]
+
+    start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase)
+    selected_phase_axis = phase_axis[start_idx:end_idx]
+    default_start, default_end = params.on_pulse
+
+    yield "{"
+    yield f'"obs_id":{_json_dumps(obs_id)},'
+    yield f'"start_phase":{_json_dumps(float(start_phase))},'
+    yield f'"end_phase":{_json_dumps(float(end_phase))},'
+    yield f'"on_pulse":{_json_dumps({"start": float(default_start), "end": float(default_end)})},'
+    yield f'"phase_axis":{_json_dumps(selected_phase_axis.tolist())},'
+    yield f'"pulse_number":{_json_dumps(params.pulse_number.tolist())},'
+    yield '"quantities":['
+
+    for quantity_index, (quantity, label) in enumerate(zip(quantities, labels)):
+        q = quantity[:, start_idx:end_idx]
+        if q.size:
+            q_min = float(np.nanmin(q))
+            q_max = float(np.nanmax(q))
+        else:
+            q_min, q_max = 0.0, 1.0
+        if np.isfinite(q_min) and np.isfinite(q_max) and q_min == q_max:
+            pad = max(abs(q_min) * 0.1, 1e-3)
+            q_min -= pad
+            q_max += pad
+
+        if quantity_index:
+            yield ","
+        yield "{"
+        yield f'"name":{_json_dumps(label)},'
+        yield '"data":['
+        for row_index, row in enumerate(q):
+            if row_index:
+                yield ","
+            yield _json_row(row)
+        yield f'],"vmin":{_json_dumps(_json_value(q_min))},"vmax":{_json_dumps(_json_value(q_max))}'
+        yield "}"
+
+    yield "]}"
 
 
 # --- Poincare sphere + polarisation fractions/angles (ported from old_modules/functions.py) ---
