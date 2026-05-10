@@ -4,3 +4,6 @@ numpy
 matplotlib
 scipy
 python-multipart
+psutil
+prometheus-fastapi-instrumentator
+prometheus-client

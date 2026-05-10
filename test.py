@@ -3,150 +3,473 @@ import matplotlib.pyplot as plt
 from scipy.stats import iqr
 from matplotlib.gridspec import GridSpec
 from matplotlib.ticker import MaxNLocator
+from dataclasses import dataclass
 
-# Helper function to compute common polarisation parameters efficiently
-def compute_common_stokes_params(data, phase_axis, on_pulse):
-    """Compute commonly used Stokes parameters efficiently to avoid redundant calculations"""
+DEBIAS_THRESHOLD = 1.57
+EPSILON = 1e-6
+STOKES_LABELS = ("I", "Q", "U", "V")
+
+
+@dataclass(slots=True)
+class StokesPrecompute:
+    data: np.ndarray
+    num_pulses: int
+    num_bins: int
+    phase_axis: np.ndarray
+    pulse_number: np.ndarray
+    I: np.ndarray
+    Q: np.ndarray
+    U: np.ndarray
+    V: np.ndarray
+    I_mean: np.ndarray
+    Q_mean: np.ndarray
+    U_mean: np.ndarray
+    V_mean: np.ndarray
+    mean_profiles: np.ndarray
+    I0: float
+    I_over_I0: np.ndarray
+    I_mean_over_I0: np.ndarray
+
+
+@dataclass(slots=True)
+class PolarimetryPrecompute(StokesPrecompute):
+    on_pulse: tuple[float, float]
+    on_pulse_mask: np.ndarray
+    off_pulse_mask: np.ndarray
+    off_pulse_std: float
+    threshold: float
+    L: np.ndarray
+    L_sigma: np.ndarray
+    L_mask: np.ndarray
+    L_true: np.ndarray
+    P: np.ndarray
+    P_sigma: np.ndarray
+    P_mask: np.ndarray
+    P_true: np.ndarray
+    p_frac: np.ndarray
+    l_frac: np.ndarray
+    v_frac: np.ndarray
+    abs_vfrac: np.ndarray
+    PA_rad: np.ndarray
+    PA_deg: np.ndarray
+    EA_rad: np.ndarray
+    EA_deg: np.ndarray
+    dPA_dphi: np.ndarray
+    pulse_off_pulse_std: np.ndarray
+    pulse_threshold: np.ndarray
+    pulse_L_true: np.ndarray
+    pulse_P_true: np.ndarray
+    pulse_p_frac: np.ndarray
+    pulse_l_frac: np.ndarray
+    pulse_v_frac: np.ndarray
+    pulse_abs_vfrac: np.ndarray
+    pulse_EA_rad: np.ndarray
+    pulse_EA_deg: np.ndarray
+    pulse_dPA_dphi: np.ndarray
+    pulse_x: np.ndarray
+    pulse_y: np.ndarray
+    pulse_z: np.ndarray
+    pulse_radius_of_curvature: np.ndarray
+    mean_L: np.ndarray
+    mean_L_sigma: np.ndarray
+    mean_L_mask: np.ndarray
+    mean_L_true: np.ndarray
+    mean_P: np.ndarray
+    mean_P_sigma: np.ndarray
+    mean_P_mask: np.ndarray
+    mean_P_true: np.ndarray
+    mean_p_frac: np.ndarray
+    mean_l_frac: np.ndarray
+    mean_v_frac: np.ndarray
+    mean_abs_vfrac: np.ndarray
+    mean_PA_rad: np.ndarray
+    mean_PA_deg: np.ndarray
+    mean_EA_rad: np.ndarray
+    mean_EA_deg: np.ndarray
+    mean_dPA_dphi: np.ndarray
+    mean_lon: np.ndarray
+    mean_lat: np.ndarray
+    mean_x: np.ndarray
+    mean_y: np.ndarray
+    mean_z: np.ndarray
+    mean_radius_of_curvature: np.ndarray
+    roc_phase: np.ndarray
+
+
+def _validate_data(data):
+    data = np.asarray(data)
+    if data.ndim != 3 or data.shape[1] < 4:
+        raise ValueError("Expected data shape (num_pulses, 4, num_phase_bins)")
+    return data
+
+
+def _safe_scalar(value):
+    value = float(value)
+    return value if np.isfinite(value) and abs(value) > EPSILON else EPSILON
+
+
+def _phase_bounds(phase_axis, start_phase, end_phase, end_side="left"):
+    start_idx = int(np.searchsorted(phase_axis, start_phase, side="left"))
+    end_idx = int(np.searchsorted(phase_axis, end_phase, side=end_side))
+    start_idx = max(0, min(start_idx, len(phase_axis)))
+    end_idx = max(0, min(end_idx, len(phase_axis)))
+    return start_idx, end_idx
+
+
+def _debias_polarisation(amplitude, sigma_off, threshold=DEBIAS_THRESHOLD):
+    """Debias polarisation amplitudes with broadcasting support."""
+    sigma_off = np.maximum(np.asarray(sigma_off, dtype=float), EPSILON)
+    sigma_ratio = amplitude / sigma_off
+    return np.where(
+        sigma_ratio >= threshold,
+        sigma_off * np.sqrt(np.maximum(sigma_ratio ** 2 - 1, 0.0)),
+        0.0,
+    )
+
+
+def _fraction(numerator, denominator, threshold):
+    out = np.zeros_like(numerator, dtype=float)
+    mask = (denominator >= threshold) & (denominator != 0)
+    return np.divide(numerator, denominator, out=out, where=mask)
+
+
+def _normalised_gradient(values, phase_axis, axis=-1, per_profile=False):
+    if len(phase_axis) < 2:
+        return np.zeros_like(values, dtype=float)
+
+    grad = np.gradient(values, phase_axis, axis=axis)
+    if per_profile:
+        max_abs = np.nanmax(np.abs(grad), axis=axis, keepdims=True)
+        return np.divide(grad, max_abs, out=np.zeros_like(grad), where=max_abs > 0)
+
+    max_abs = np.nanmax(np.abs(grad))
+    return grad / max_abs if max_abs > 0 else np.zeros_like(grad)
+
+
+def _radius_of_curvature_from_xyz(x, y, z):
+    points = np.stack((x, y, z), axis=-1)
+    radius = np.full(points.shape[:-1], np.nan, dtype=float)
+    if points.shape[-2] < 3:
+        return radius
+
+    norms = np.linalg.norm(points, axis=-1, keepdims=True)
+    unit_points = np.divide(points, norms, out=np.zeros_like(points), where=norms > 0)
+    p1 = unit_points[..., :-2, :]
+    p2 = unit_points[..., 1:-1, :]
+    p3 = unit_points[..., 2:, :]
+
+    normal = np.cross(p2 - p1, p3 - p1)
+    normal_norm = np.linalg.norm(normal, axis=-1, keepdims=True)
+    valid = normal_norm[..., 0] > 0
+    unit_normal = np.divide(normal, normal_norm, out=np.zeros_like(normal), where=normal_norm > 0)
+    d = np.abs(np.sum(p1 * unit_normal, axis=-1))
+    d = np.clip(d, 0.0, 1.0)
+    radius[..., 1:-1] = np.where(valid, np.sqrt(1.0 - d ** 2), np.nan)
+    return radius
+
+
+def precompute_stokes(data):
+    """Precompute shape, phase, raw Stokes views, and mean profiles once per dataset."""
+    data = _validate_data(data)
+    num_pulses, _, num_bins = data.shape
+    phase_axis = np.linspace(0, 1, num_bins)
+    pulse_number = np.arange(num_pulses)
     I = data[:, 0, :]
     Q = data[:, 1, :]
     U = data[:, 2, :]
     V = data[:, 3, :]
-    
-    default_start, default_end = on_pulse
-    on_pulse_mask = (phase_axis >= default_start) & (phase_axis <= default_end)
+    mean_profiles = data[:, :4, :].mean(axis=0)
+    I_mean, Q_mean, U_mean, V_mean = mean_profiles
+    I0 = float(np.nanmax(np.abs(I_mean))) if I_mean.size else 0.0
+    I0_safe = I0 if I0 > EPSILON else EPSILON
+
+    return StokesPrecompute(
+        data=data,
+        num_pulses=num_pulses,
+        num_bins=num_bins,
+        phase_axis=phase_axis,
+        pulse_number=pulse_number,
+        I=I,
+        Q=Q,
+        U=U,
+        V=V,
+        I_mean=I_mean,
+        Q_mean=Q_mean,
+        U_mean=U_mean,
+        V_mean=V_mean,
+        mean_profiles=mean_profiles,
+        I0=I0_safe,
+        I_over_I0=I / I0_safe,
+        I_mean_over_I0=I_mean / I0_safe,
+    )
+
+
+def _as_stokes_precompute(data_or_precomputed):
+    if isinstance(data_or_precomputed, StokesPrecompute):
+        return data_or_precomputed
+    return precompute_stokes(data_or_precomputed)
+
+
+def precompute_polarimetry(data_or_precomputed, on_pulse):
+    """Precompute on-pulse-dependent derived arrays once and reuse slices later."""
+    base = _as_stokes_precompute(data_or_precomputed)
+    default_start, default_end = (float(on_pulse[0]), float(on_pulse[1]))
+    on_pulse_mask = (base.phase_axis >= default_start) & (base.phase_axis <= default_end)
     off_pulse_mask = ~on_pulse_mask
-    
-    I_mean = I.mean(axis=0)
-    off_pulse_std = np.std(I_mean[off_pulse_mask]) if np.any(off_pulse_mask) else 1e-6
-    off_pulse_std = off_pulse_std if off_pulse_std != 0 else 1e-6
-    
-    threshold = np.min(I_mean[on_pulse_mask]) if np.any(on_pulse_mask) else np.min(I_mean)
-    
-    # Compute L_true
-    L = np.sqrt(Q**2 + U**2)
-    L_true = np.zeros_like(L)
+
+    if np.any(off_pulse_mask):
+        off_pulse_std = _safe_scalar(np.std(base.I_mean[off_pulse_mask]))
+        pulse_off_pulse_std = np.std(base.I[:, off_pulse_mask], axis=1, keepdims=True)
+    else:
+        off_pulse_std = EPSILON
+        pulse_off_pulse_std = np.full((base.num_pulses, 1), EPSILON)
+    pulse_off_pulse_std = np.maximum(pulse_off_pulse_std, EPSILON)
+
+    threshold = float(np.min(base.I_mean[on_pulse_mask])) if np.any(on_pulse_mask) else float(np.min(base.I_mean))
+    if np.any(on_pulse_mask):
+        pulse_threshold = np.min(base.I[:, on_pulse_mask], axis=1, keepdims=True)
+    else:
+        pulse_threshold = np.min(base.I, axis=1, keepdims=True)
+
+    L = np.sqrt(base.Q ** 2 + base.U ** 2)
+    P = np.sqrt(base.Q ** 2 + base.U ** 2 + base.V ** 2)
     L_sigma = L / off_pulse_std
-    mask = L_sigma >= 1.57
-    L_true[mask] = off_pulse_std * np.sqrt(L_sigma[mask]**2 - 1)
-    
-    # Compute P_true
-    P = np.sqrt(Q**2 + U**2 + V**2)
     P_sigma = P / off_pulse_std
-    P_true = np.zeros_like(P)
-    mask = P_sigma >= 1.57
-    P_true[mask] = off_pulse_std * np.sqrt(P_sigma[mask]**2 - 1)
-    
+    L_mask = L_sigma >= DEBIAS_THRESHOLD
+    P_mask = P_sigma >= DEBIAS_THRESHOLD
+    L_true = _debias_polarisation(L, off_pulse_std)
+    P_true = _debias_polarisation(P, off_pulse_std)
+
+    p_frac = _fraction(P_true, base.I, threshold)
+    l_frac = _fraction(L_true, base.I, threshold)
+    v_frac = _fraction(base.V, base.I, threshold)
+    abs_vfrac = np.abs(v_frac)
+    PA_rad = 0.5 * np.arctan2(base.U, base.Q)
+    PA_deg = np.degrees(PA_rad)
+    EA_rad = 0.5 * np.arctan2(base.V, L_true)
+    EA_deg = np.degrees(EA_rad)
+    dPA_dphi = _normalised_gradient(PA_deg, base.phase_axis, axis=-1)
+
+    pulse_L_true = _debias_polarisation(L, pulse_off_pulse_std)
+    pulse_P_true = _debias_polarisation(P, pulse_off_pulse_std)
+    pulse_p_frac = _fraction(pulse_P_true, base.I, pulse_threshold)
+    pulse_l_frac = _fraction(pulse_L_true, base.I, pulse_threshold)
+    pulse_v_frac = _fraction(base.V, base.I, pulse_threshold)
+    pulse_abs_vfrac = np.abs(pulse_v_frac)
+    pulse_EA_rad = 0.5 * np.arctan2(base.V, pulse_L_true)
+    pulse_EA_deg = np.degrees(pulse_EA_rad)
+    pulse_dPA_dphi = _normalised_gradient(PA_deg, base.phase_axis, axis=-1, per_profile=True)
+    pulse_lon = 2 * PA_rad
+    pulse_lat = 2 * pulse_EA_rad
+    pulse_cos_lat = np.cos(pulse_lat)
+    pulse_x = pulse_cos_lat * np.cos(pulse_lon)
+    pulse_y = pulse_cos_lat * np.sin(pulse_lon)
+    pulse_z = np.sin(pulse_lat)
+    pulse_radius_of_curvature = _radius_of_curvature_from_xyz(pulse_x, pulse_y, pulse_z)
+
+    mean_L = np.sqrt(base.Q_mean ** 2 + base.U_mean ** 2)
+    mean_P = np.sqrt(base.Q_mean ** 2 + base.U_mean ** 2 + base.V_mean ** 2)
+    mean_L_sigma = mean_L / off_pulse_std
+    mean_P_sigma = mean_P / off_pulse_std
+    mean_L_mask = mean_L_sigma >= DEBIAS_THRESHOLD
+    mean_P_mask = mean_P_sigma >= DEBIAS_THRESHOLD
+    mean_L_true = _debias_polarisation(mean_L, off_pulse_std)
+    mean_P_true = _debias_polarisation(mean_P, off_pulse_std)
+    mean_p_frac = _fraction(mean_P_true, base.I_mean, threshold)
+    mean_l_frac = _fraction(mean_L_true, base.I_mean, threshold)
+    mean_v_frac = _fraction(base.V_mean, base.I_mean, threshold)
+    mean_abs_vfrac = np.abs(mean_v_frac)
+    mean_PA_rad = 0.5 * np.arctan2(base.U_mean, base.Q_mean)
+    mean_PA_deg = np.degrees(mean_PA_rad)
+    mean_EA_rad = 0.5 * np.arctan2(base.V_mean, mean_L_true)
+    mean_EA_deg = np.degrees(mean_EA_rad)
+    mean_dPA_dphi = _normalised_gradient(mean_PA_deg, base.phase_axis)
+    mean_lon = 2 * mean_PA_rad
+    mean_lat = 2 * mean_EA_rad
+    mean_cos_lat = np.cos(mean_lat)
+    mean_x = mean_cos_lat * np.cos(mean_lon)
+    mean_y = mean_cos_lat * np.sin(mean_lon)
+    mean_z = np.sin(mean_lat)
+    mean_radius_of_curvature = _radius_of_curvature_from_xyz(mean_x, mean_y, mean_z)
+
+    return PolarimetryPrecompute(
+        data=base.data,
+        num_pulses=base.num_pulses,
+        num_bins=base.num_bins,
+        phase_axis=base.phase_axis,
+        pulse_number=base.pulse_number,
+        I=base.I,
+        Q=base.Q,
+        U=base.U,
+        V=base.V,
+        I_mean=base.I_mean,
+        Q_mean=base.Q_mean,
+        U_mean=base.U_mean,
+        V_mean=base.V_mean,
+        mean_profiles=base.mean_profiles,
+        I0=base.I0,
+        I_over_I0=base.I_over_I0,
+        I_mean_over_I0=base.I_mean_over_I0,
+        on_pulse=(default_start, default_end),
+        on_pulse_mask=on_pulse_mask,
+        off_pulse_mask=off_pulse_mask,
+        off_pulse_std=off_pulse_std,
+        threshold=threshold,
+        L=L,
+        L_sigma=L_sigma,
+        L_mask=L_mask,
+        L_true=L_true,
+        P=P,
+        P_sigma=P_sigma,
+        P_mask=P_mask,
+        P_true=P_true,
+        p_frac=p_frac,
+        l_frac=l_frac,
+        v_frac=v_frac,
+        abs_vfrac=abs_vfrac,
+        PA_rad=PA_rad,
+        PA_deg=PA_deg,
+        EA_rad=EA_rad,
+        EA_deg=EA_deg,
+        dPA_dphi=dPA_dphi,
+        pulse_off_pulse_std=pulse_off_pulse_std,
+        pulse_threshold=pulse_threshold,
+        pulse_L_true=pulse_L_true,
+        pulse_P_true=pulse_P_true,
+        pulse_p_frac=pulse_p_frac,
+        pulse_l_frac=pulse_l_frac,
+        pulse_v_frac=pulse_v_frac,
+        pulse_abs_vfrac=pulse_abs_vfrac,
+        pulse_EA_rad=pulse_EA_rad,
+        pulse_EA_deg=pulse_EA_deg,
+        pulse_dPA_dphi=pulse_dPA_dphi,
+        pulse_x=pulse_x,
+        pulse_y=pulse_y,
+        pulse_z=pulse_z,
+        pulse_radius_of_curvature=pulse_radius_of_curvature,
+        mean_L=mean_L,
+        mean_L_sigma=mean_L_sigma,
+        mean_L_mask=mean_L_mask,
+        mean_L_true=mean_L_true,
+        mean_P=mean_P,
+        mean_P_sigma=mean_P_sigma,
+        mean_P_mask=mean_P_mask,
+        mean_P_true=mean_P_true,
+        mean_p_frac=mean_p_frac,
+        mean_l_frac=mean_l_frac,
+        mean_v_frac=mean_v_frac,
+        mean_abs_vfrac=mean_abs_vfrac,
+        mean_PA_rad=mean_PA_rad,
+        mean_PA_deg=mean_PA_deg,
+        mean_EA_rad=mean_EA_rad,
+        mean_EA_deg=mean_EA_deg,
+        mean_dPA_dphi=mean_dPA_dphi,
+        mean_lon=mean_lon,
+        mean_lat=mean_lat,
+        mean_x=mean_x,
+        mean_y=mean_y,
+        mean_z=mean_z,
+        mean_radius_of_curvature=mean_radius_of_curvature,
+        roc_phase=base.phase_axis,
+    )
+
+
+def _as_polarimetry_precompute(data_or_precomputed, on_pulse):
+    if isinstance(data_or_precomputed, PolarimetryPrecompute):
+        return data_or_precomputed
+    return precompute_polarimetry(data_or_precomputed, on_pulse)
+
+
+def compute_common_stokes_params(data, phase_axis=None, on_pulse=None):
+    """Return cached/common arrays in the legacy dictionary shape."""
+    if isinstance(data, PolarimetryPrecompute):
+        params = data
+    else:
+        if on_pulse is None:
+            raise ValueError("on_pulse is required when raw data is provided")
+        params = precompute_polarimetry(data, on_pulse)
+
     return {
-        'I': I, 'Q': Q, 'U': U, 'V': V,
-        'I_mean': I_mean,
-        'L_true': L_true,
-        'P_true': P_true,
-        'off_pulse_std': off_pulse_std,
-        'threshold': threshold,
-        'on_pulse_mask': on_pulse_mask,
-        'off_pulse_mask': off_pulse_mask
+        "I": params.I,
+        "Q": params.Q,
+        "U": params.U,
+        "V": params.V,
+        "I_mean": params.I_mean,
+        "Q_mean": params.Q_mean,
+        "U_mean": params.U_mean,
+        "V_mean": params.V_mean,
+        "I_over_I0": params.I_over_I0,
+        "I_mean_over_I0": params.I_mean_over_I0,
+        "L": params.L,
+        "L_sigma": params.L_sigma,
+        "L_mask": params.L_mask,
+        "L_true": params.L_true,
+        "P": params.P,
+        "P_sigma": params.P_sigma,
+        "P_mask": params.P_mask,
+        "P_true": params.P_true,
+        "p_frac": params.p_frac,
+        "l_frac": params.l_frac,
+        "v_frac": params.v_frac,
+        "abs_vfrac": params.abs_vfrac,
+        "PA": params.PA_deg,
+        "EA": params.EA_deg,
+        "dPA": params.dPA_dphi,
+        "off_pulse_std": params.off_pulse_std,
+        "threshold": params.threshold,
+        "on_pulse_mask": params.on_pulse_mask,
+        "off_pulse_mask": params.off_pulse_mask,
     }
 
 def return_xyz_interactive_poincare_sphere(data, start_phase, end_phase, on_pulse, obs_id):
-    num_pulses, _, num_bins = data.shape
-
-    print(f"Number of pulses: {num_pulses}, Number of bins: {num_bins}")
-    phase_axis = np.linspace(0, 1, num_bins)
-
-    I = data[:, 0, :].mean(axis=0)
-    Q = data[:, 1, :].mean(axis=0)
-    U = data[:, 2, :].mean(axis=0)
-    V = data[:, 3, :].mean(axis=0)
-
-    default_start, default_end = on_pulse
-    on_pulse_mask = (phase_axis >= default_start) & (phase_axis <= default_end)
-    off_pulse_mask = ~on_pulse_mask
-    sigma_off = np.std(I[off_pulse_mask])
-    L = np.sqrt(Q**2 + U**2)
-    L_true = np.zeros_like(L)
-    L_sigma = L / sigma_off
-    mask = L_sigma >= 1.57
-    L_true[mask] = sigma_off * np.sqrt(L_sigma[mask]**2 - 1)
-
-    threshold = np.min(I[on_pulse_mask])
-    P = np.sqrt(Q**2 + U**2 + V**2)
-    P_sigma = P / sigma_off
-    P_true = np.zeros_like(P)
-    mask = P_sigma >= 1.57
-    P_true[mask] = sigma_off * np.sqrt(P_sigma[mask]**2 - 1)
-    p_frac = np.where(I >= threshold, P_true/I , 0)
-
-    PA = 0.5 * np.arctan2(U, Q)
-    EA = 0.5 * np.arctan2(V, L_true)
-
-    lon = 2 * PA
-    lat = 2 * EA
-    x = np.cos(lat) * np.cos(lon)
-    y = np.cos(lat) * np.sin(lon)
-    z = np.sin(lat)
-
-    start_idx = np.searchsorted(phase_axis, start_phase)
-    end_idx = np.searchsorted(phase_axis, end_phase)
-
-    x = x[start_idx:end_idx]
-    y = y[start_idx:end_idx]
-    z = z[start_idx:end_idx]
-    
-    return x, y, z # This will be sent to the frontend for interactive plotting
+    params = _as_polarimetry_precompute(data, on_pulse)
+    start_idx, end_idx = _phase_bounds(params.phase_axis, start_phase, end_phase)
+    return (
+        params.mean_x[start_idx:end_idx],
+        params.mean_y[start_idx:end_idx],
+        params.mean_z[start_idx:end_idx],
+    )
 
 def get_all_profiles(data, start_phase, end_phase):
     """Get all 4 Stokes profiles efficiently in one call"""
-    pulse_phase = np.linspace(0, 1, data.shape[2])
-    
-    profiles = {}
-    for idx, label in enumerate(['I', 'Q', 'U', 'V']):
-        mean_profile = data[:, idx, :].mean(axis=0)
-        profiles[label] = {'x': pulse_phase, 'y': mean_profile}
-    
-    return profiles
+    params = _as_stokes_precompute(data)
+    return {
+        label: {"x": params.phase_axis, "y": params.mean_profiles[idx]}
+        for idx, label in enumerate(STOKES_LABELS)
+    }
 
 def get_I_profile(data, start_phase, end_phase):
-    pulse_phase = np.linspace(0, 1, data.shape[2])
-    mean_profile = data[:, 0, :].mean(axis=0)
-    return pulse_phase, mean_profile
+    params = _as_stokes_precompute(data)
+    return params.phase_axis, params.I_mean
 
 def get_Q_profile(data, start_phase, end_phase):
-    pulse_phase = np.linspace(0, 1, data.shape[2])
-    mean_profile = data[:, 1, :].mean(axis=0)
-    return pulse_phase, mean_profile
+    params = _as_stokes_precompute(data)
+    return params.phase_axis, params.Q_mean
 
 def get_U_profile(data, start_phase, end_phase):
-    pulse_phase = np.linspace(0, 1, data.shape[2])
-    mean_profile = data[:, 2, :].mean(axis=0)
-    return pulse_phase, mean_profile
+    params = _as_stokes_precompute(data)
+    return params.phase_axis, params.U_mean
 
 def get_V_profile(data, start_phase, end_phase):
-    pulse_phase = np.linspace(0, 1, data.shape[2])
-    mean_profile = data[:, 3, :].mean(axis=0)
-    return pulse_phase, mean_profile
+    params = _as_stokes_precompute(data)
+    return params.phase_axis, params.V_mean
 
 # Unified function to compute all heatmaps in one pass
 def plot_all_heatmaps(data, start_phase, end_phase, obs_id):
     """Compute all four Stokes heatmaps (I, Q, U, V) efficiently in a single pass."""
-    # Compute common parameters once
-    pulse_phase = np.linspace(0, 1, data.shape[2])
-    pulse_number = np.arange(data.shape[0])
-    start_idx = np.searchsorted(pulse_phase, start_phase, side='left')
-    end_idx = np.searchsorted(pulse_phase, end_phase, side='right')
-    phase_slice = pulse_phase[start_idx:end_idx]
-    
-    # Compute all four Stokes heatmaps
+    params = _as_stokes_precompute(data)
+    start_idx, end_idx = _phase_bounds(params.phase_axis, start_phase, end_phase, end_side="right")
+    phase_slice = params.phase_axis[start_idx:end_idx]
+
     heatmaps = {}
-    labels = ['I', 'Q', 'U', 'V']
-    
-    for stokes_idx, label in enumerate(labels):
-        heatmap_data = data[:, stokes_idx, start_idx:end_idx]
+    for stokes_idx, label in enumerate(STOKES_LABELS):
+        heatmap_data = params.data[:, stokes_idx, start_idx:end_idx]
         vmin = heatmap_data.min()
         vmax = heatmap_data.max()
         
         heatmaps[label] = {
             'pulse_phase': phase_slice,
-            'pulse_number': pulse_number,
+            'pulse_number': params.pulse_number,
             'heatmap_data': heatmap_data,
             'vmin': float(vmin),
             'vmax': float(vmax),
@@ -170,39 +493,12 @@ def plot_V_heatmap(data, start_phase, end_phase, obs_id):
     return plot_all_heatmaps(data, start_phase, end_phase, obs_id)['V']
 
 def plot_poincare_aitoff_at_phase(data, on_pulse, cphase, obs_id):
-    num_pulses, _, num_bins = data.shape
-    phase_axis = np.linspace(0, 1, num_bins)
-    cbin = np.argmin(np.abs(phase_axis - cphase))
+    params = _as_polarimetry_precompute(data, on_pulse)
+    cbin = int(np.argmin(np.abs(params.phase_axis - cphase)))
 
-    default_start, default_end = on_pulse
-    on_pulse_mask = (phase_axis >= default_start) & (phase_axis <= default_end)
-    off_pulse_mask = ~on_pulse_mask
+    pa_val = params.PA_rad[:, cbin]
+    ea_val = params.pulse_EA_rad[:, cbin]
 
-    # Vectorized computation for all pulses at once
-    I = data[:, 0, :]  # shape: (num_pulses, num_bins)
-    Q = data[:, 1, :]
-    U = data[:, 2, :]
-    V = data[:, 3, :]
-    
-    # Compute off_pulse_std for each pulse
-    off_pulse_std = np.std(I[:, off_pulse_mask], axis=1, keepdims=True)  # shape: (num_pulses, 1)
-    off_pulse_std = np.where(off_pulse_std == 0, 1e-6, off_pulse_std)
-    
-    # Vectorized L_true computation
-    L = np.sqrt(Q**2 + U**2)
-    L_sigma = L / off_pulse_std
-    L_true = np.zeros_like(L)
-    mask = L_sigma >= 1.57
-    L_true[mask] = off_pulse_std.repeat(num_bins, axis=1)[mask] * np.sqrt(L_sigma[mask]**2 - 1)
-    
-    # Vectorized PA and EA
-    PA = 0.5 * np.arctan2(U, Q)
-    EA = 0.5 * np.arctan2(V, L_true)
-    
-    # Extract values at the specific bin for all pulses
-    pa_val = PA[:, cbin]
-    ea_val = EA[:, cbin]
-    
     lon = 2 * pa_val
     lat = 2 * ea_val
     lon = np.mod(lon + np.pi, 2 * np.pi) - np.pi
@@ -210,30 +506,14 @@ def plot_poincare_aitoff_at_phase(data, on_pulse, cphase, obs_id):
     return lon, lat
 
 def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phase, on_pulse, obs_id, default_bins=200, return_data=False):
-    num_pulses, _, num_phase_bins = data.shape
-    phase_axis = np.linspace(0, 1, num_phase_bins)
-    
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
+    num_pulses = params.num_pulses
+
     phase_values = [left_phase, mid_phase, right_phase]
     phase_bins = [np.argmin(np.abs(phase_axis - val)) for val in phase_values]
 
-    # Use optimized helper function
-    params = compute_common_stokes_params(data, phase_axis, on_pulse)
-    I = params['I']
-    threshold = params['threshold']
-    L_true = params['L_true']
-    P_true = params['P_true']
-    Q = params['Q']
-    U = params['U']
-    V = params['V']
-
-    p_frac = np.where(I >= threshold, P_true / I, 0)
-    l_frac = np.where(I >= threshold, L_true / I, 0)
-    v_frac = np.where(I >= threshold, V / I, 0)
-    absv_frac = np.where(I >= threshold, np.abs(V / I), 0)
-    PA = 0.5 * np.arctan2(U, Q) * 180 / np.pi
-    EA = 0.5 * np.arctan2(V, L_true) * 180 / np.pi
-
-    quantities = [p_frac, l_frac, absv_frac, v_frac, PA, EA]
+    quantities = [params.p_frac, params.l_frac, params.abs_vfrac, params.v_frac, params.PA_deg, params.EA_deg]
     quantity_names = ["P/I", "L/I", "|V/I|", "V/I", "PA [deg]", "EA [deg]"]
 
     def compute_bin_count(values):
@@ -317,52 +597,32 @@ def polarisation_histogram_single(data, start_phase, end_phase, on_pulse, obs_id
     """
     quantity_key in {"PA", "EA", "P/I", "L/I", "|V/I|", "V/I", "I", "dPA"}
     """
-    num_pulses, _, num_phase_bins = data.shape
-    phase_axis = np.linspace(0, 1, num_phase_bins)
-
-    # Use optimized helper function
-    params = compute_common_stokes_params(data, phase_axis, on_pulse)
-    I = params['I']
-    Q = params['Q']
-    U = params['U']
-    V = params['V']
-    L_true = params['L_true']
-    P_true = params['P_true']
-    threshold = params['threshold']
-    I_mean = params['I_mean']
-    
-    p_frac = np.where(I >= threshold, P_true/I , 0)
-    l_frac = np.where(I >= threshold, L_true / I, 0)
-    v_frac = np.where(I >= threshold, V / I, 0)
-    absv_frac = np.where(I >= threshold, np.abs(V / I), 0)
-    PA = 0.5 * np.arctan2(U, Q) * 180 / np.pi
-    EA = 0.5 * np.arctan2(V, L_true) * 180 / np.pi
-    dPA_dphi = np.gradient(PA, phase_axis, axis=-1)
-    dPA_dphi = dPA_dphi / (np.max(np.abs(dPA_dphi)) if np.max(np.abs(dPA_dphi)) != 0 else 1)
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
+    num_pulses = params.num_pulses
 
     quantity_map = {
-        "PA": (PA, "PA [deg]", False),
-        "EA": (EA, "EA [deg]", False),
-        "P/I": (p_frac, "P/I", True),
-        "L/I": (l_frac, "L/I", True),
-        "|V/I|": (absv_frac, "|V/I|", True),
-        "V/I": (v_frac, "V/I", True),
-        "I": (I, "I", False),
-        "dPA": (dPA_dphi, "Normalised PA Derivative", False),
+        "PA": (params.PA_deg, "PA [deg]", False),
+        "EA": (params.EA_deg, "EA [deg]", False),
+        "P/I": (params.p_frac, "P/I", True),
+        "L/I": (params.l_frac, "L/I", True),
+        "|V/I|": (params.abs_vfrac, "|V/I|", True),
+        "V/I": (params.v_frac, "V/I", True),
+        "I": (params.I, "I", False),
+        "dPA": (params.dPA_dphi, "Normalised PA Derivative", False),
     }
     if quantity_key not in quantity_map:
         return {"error": f"Unknown quantity {quantity_key}"}
 
     quantity, label, is_fraction = quantity_map[quantity_key]
 
-    start_idx = np.searchsorted(phase_axis, start_phase, side='left')
-    end_idx = np.searchsorted(phase_axis, end_phase, side='right')
+    start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase, end_side="right")
     selected_phase_axis = phase_axis[start_idx:end_idx]
     selected_phase_bins = end_idx - start_idx
 
-    default_start, default_end = on_pulse
-    max_I = np.max(I_mean)
-    lowfrac = threshold/max_I if max_I != 0 else 0
+    default_start, default_end = params.on_pulse
+    max_I = np.max(params.I_mean)
+    lowfrac = params.threshold / max_I if max_I != 0 else 0
     quantity_bins = max(50, min(base_quantity_bins, selected_phase_bins)) if selected_phase_bins > 0 else 50
 
     if selected_phase_bins <= 0:
@@ -433,34 +693,17 @@ def polarisation_histogram_single(data, start_phase, end_phase, on_pulse, obs_id
     }
 
 def plot_polarisation_stacks(data, start_phase, end_phase, on_pulse, obs_id, return_data=False):
-    num_pulses, _, num_phase_bins = data.shape
-    phase_axis = np.linspace(0, 1, num_phase_bins)
-
-    # Use optimized helper function
-    params = compute_common_stokes_params(data, phase_axis, on_pulse)
-    I = params['I']
-    Q = params['Q']
-    U = params['U']
-    V = params['V']
-    L_true = params['L_true']
-    P_true = params['P_true']
-    threshold = params['threshold']
-
-    p_frac = np.where(I >= threshold, P_true / I, 0)
-    l_frac = np.where(I >= threshold, L_true / I, 0)
-    v_frac = np.where(I >= threshold, V / I, 0)
-    absv_frac = np.where(I >= threshold, np.abs(V / I), 0)
-    PA = 0.5 * np.arctan2(U, Q) * 180 / np.pi
-    EA = 0.5 * np.arctan2(V, L_true) * 180 / np.pi
-    quantities = [PA, EA, p_frac, l_frac, absv_frac, v_frac]
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
+    num_pulses = params.num_pulses
+    quantities = [params.PA_deg, params.EA_deg, params.p_frac, params.l_frac, params.abs_vfrac, params.v_frac]
     labels = ["PA [deg]", "EA [deg]", "P/I", "L/I", "|V/I|", "V/I"]
 
-    start_idx = np.searchsorted(phase_axis, start_phase)
-    end_idx = np.searchsorted(phase_axis, end_phase)
+    start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase)
     selected_phase_axis = phase_axis[start_idx:end_idx]
 
     if return_data:
-        default_start, default_end = on_pulse
+        default_start, default_end = params.on_pulse
         payload = {
             "obs_id": obs_id,
             "start_phase": float(start_phase),
@@ -507,65 +750,38 @@ def find_radius(points):
     return np.sqrt(1.0 - d ** 2)
 
 
-def _debias_polarisation(amplitude, sigma_off, threshold=1.57):
-    """Helper function to debias polarisation amplitudes."""
-    debiased = np.zeros_like(amplitude)
-    sigma_ratio = amplitude / sigma_off
-    mask = sigma_ratio >= threshold
-    debiased[mask] = sigma_off * np.sqrt(sigma_ratio[mask] ** 2 - 1)
-    return debiased
-
-
 def compute_polarisation_parameters(I, Q, U, V, phase_axis, on_pulse):
     start, end = on_pulse
     on_mask = (phase_axis >= start) & (phase_axis <= end)
     off_mask = ~on_mask
 
-    sigma_off = np.std(I[off_mask]) if np.any(off_mask) else 1e-6
-    sigma_off = max(sigma_off, 1e-6)  # Ensure numerical stability
+    sigma_off = _safe_scalar(np.std(I[off_mask])) if np.any(off_mask) else EPSILON
     threshold = np.min(I[on_mask]) if np.any(on_mask) else np.min(I)
 
-    # Compute Stokes amplitudes
     Q_sq, U_sq, V_sq = Q ** 2, U ** 2, V ** 2
     L = np.sqrt(Q_sq + U_sq)
     P = np.sqrt(Q_sq + U_sq + V_sq)
-
-    # Debias using helper function
     L_true = _debias_polarisation(L, sigma_off)
     P_true = _debias_polarisation(P, sigma_off)
 
-    # Compute fractions efficiently
-    I_safe = np.where(I >= threshold, I, np.inf)  # Avoid division by zero
-    p_frac = np.where(I >= threshold, P_true / I_safe, 0.0)
-    l_frac = np.where(I >= threshold, L_true / I_safe, 0.0)
-    v_frac = np.where(I >= threshold, V / I_safe, 0.0)
+    p_frac = _fraction(P_true, I, threshold)
+    l_frac = _fraction(L_true, I, threshold)
+    v_frac = _fraction(V, I, threshold)
     absv_frac = np.abs(v_frac)
 
-    # Compute angles
     PA_rad = 0.5 * np.arctan2(U, Q)
     EA_rad = 0.5 * np.arctan2(V, L_true)
-    PA = PA_rad * 180 / np.pi
-    EA = EA_rad * 180 / np.pi
+    PA = np.degrees(PA_rad)
+    EA = np.degrees(EA_rad)
 
-    # Normalize PA derivative
-    dPA = np.gradient(PA, phase_axis)
-    max_dPA = np.nanmax(np.abs(dPA))
-    if max_dPA > 0:
-        dPA /= max_dPA
-
-    # Compute Poincare sphere coordinates (optimized)
+    dPA = _normalised_gradient(PA, phase_axis)
     lon = 2 * PA_rad
     lat = 2 * EA_rad
     cos_lat = np.cos(lat)
     x = cos_lat * np.cos(lon)
     y = cos_lat * np.sin(lon)
     z = np.sin(lat)
-
-    # Compute radius of curvature
-    points = np.column_stack((x, y, z))
-    roc = np.full(len(points), np.nan)
-    for i in range(len(points) - 2):
-        roc[i + 1] = find_radius(points[i:i + 3])
+    roc = _radius_of_curvature_from_xyz(x, y, z)
 
     return dict(
         I=I,
@@ -589,6 +805,52 @@ def compute_polarisation_parameters(I, Q, U, V, phase_axis, on_pulse):
     )
 
 
+def _polarisation_entry(params, pulse_index):
+    if pulse_index == 0:
+        return dict(
+            I=params.I_mean,
+            Q=params.Q_mean,
+            U=params.U_mean,
+            V=params.V_mean,
+            L=params.mean_L_true,
+            P=params.mean_P_true,
+            p_frac=params.mean_p_frac,
+            l_frac=params.mean_l_frac,
+            v_frac=params.mean_v_frac,
+            absv_frac=params.mean_abs_vfrac,
+            PA=params.mean_PA_deg,
+            EA=params.mean_EA_deg,
+            dPA=params.mean_dPA_dphi,
+            x=params.mean_x,
+            y=params.mean_y,
+            z=params.mean_z,
+            radius_of_curvature=params.mean_radius_of_curvature,
+            roc_phase=params.roc_phase,
+        )
+
+    pulse_idx = pulse_index - 1
+    return dict(
+        I=params.I[pulse_idx],
+        Q=params.Q[pulse_idx],
+        U=params.U[pulse_idx],
+        V=params.V[pulse_idx],
+        L=params.pulse_L_true[pulse_idx],
+        P=params.pulse_P_true[pulse_idx],
+        p_frac=params.pulse_p_frac[pulse_idx],
+        l_frac=params.pulse_l_frac[pulse_idx],
+        v_frac=params.pulse_v_frac[pulse_idx],
+        absv_frac=params.pulse_abs_vfrac[pulse_idx],
+        PA=params.PA_deg[pulse_idx],
+        EA=params.pulse_EA_deg[pulse_idx],
+        dPA=params.pulse_dPA_dphi[pulse_idx],
+        x=params.pulse_x[pulse_idx],
+        y=params.pulse_y[pulse_idx],
+        z=params.pulse_z[pulse_idx],
+        radius_of_curvature=params.pulse_radius_of_curvature[pulse_idx],
+        roc_phase=params.roc_phase,
+    )
+
+
 def build_polarisation_dataset(data, on_pulse):
     """
     Build derived-parameter dataset.
@@ -600,27 +862,9 @@ def build_polarisation_dataset(data, on_pulse):
       ...
     """
 
-    npulse, _, nphase = data.shape
-    phase_axis = np.linspace(0, 1, nphase)
-
-    # Preallocate list for better performance
-    dataset = [None] * (npulse + 1)
-
-    # Compute integrated profile (mean across all pulses)
-    I_mean = data[:, 0, :].mean(axis=0)
-    Q_mean = data[:, 1, :].mean(axis=0)
-    U_mean = data[:, 2, :].mean(axis=0)
-    V_mean = data[:, 3, :].mean(axis=0)
-    dataset[0] = compute_polarisation_parameters(I_mean, Q_mean, U_mean, V_mean, phase_axis, on_pulse)
-
-    # Compute individual pulse parameters
-    for p in range(npulse):
-        dataset[p + 1] = compute_polarisation_parameters(
-            data[p, 0, :], data[p, 1, :], data[p, 2, :], data[p, 3, :],
-            phase_axis, on_pulse
-        )
-
-    return dataset, phase_axis
+    params = _as_polarimetry_precompute(data, on_pulse)
+    dataset = [_polarisation_entry(params, idx) for idx in range(params.num_pulses + 1)]
+    return dataset, params.phase_axis
 
 
 def get_pulse_parameters(dataset, pulse_index):
@@ -639,29 +883,29 @@ def build_polarisation_payload(data, start_phase, end_phase, on_pulse, max_pulse
         # Replace NaN/inf with None for valid JSON serialization
         return np.where(np.isfinite(arr), arr, None).tolist()
 
-    dataset, phase_axis = build_polarisation_dataset(data, on_pulse)
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
 
-    start_idx = np.searchsorted(phase_axis, start_phase, side="left")
-    end_idx = np.searchsorted(phase_axis, end_phase, side="right")
+    start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase, end_side="right")
 
     # Early return for invalid phase range
     if start_idx >= end_idx:
         return {
             "start_phase": float(start_phase),
             "end_phase": float(end_phase),
-            "on_pulse": {"start": float(on_pulse[0]), "end": float(on_pulse[1])},
+            "on_pulse": {"start": float(params.on_pulse[0]), "end": float(params.on_pulse[1])},
             "phase_axis": [],
-            "num_pulses": int(data.shape[0]),
+            "num_pulses": int(params.num_pulses),
             "dataset": [],
             "warning": "No phase bins selected; adjust start_phase/end_phase",
         }
 
     phase_slice = phase_axis[start_idx:end_idx]
-    total_subpulses = len(dataset) - 1
+    total_subpulses = params.num_pulses
 
     # Determine which pulse indices to include
     if max_pulses is None:
-        indices = list(range(len(dataset)))
+        indices = range(total_subpulses + 1)
     else:
         max_pulses = max(0, min(int(max_pulses), total_subpulses))
         indices = [0] + list(range(1, max_pulses + 1))
@@ -669,7 +913,7 @@ def build_polarisation_payload(data, start_phase, end_phase, on_pulse, max_pulse
     # Build payload efficiently
     payload_dataset = []
     for idx in indices:
-        entry = dataset[idx]
+        entry = _polarisation_entry(params, idx)
         sliced = {"pulse_index": idx}
         for key, val in entry.items():
             if isinstance(val, np.ndarray):
@@ -681,8 +925,8 @@ def build_polarisation_payload(data, start_phase, end_phase, on_pulse, max_pulse
     return {
         "start_phase": float(start_phase),
         "end_phase": float(end_phase),
-        "on_pulse": {"start": float(on_pulse[0]), "end": float(on_pulse[1])},
+        "on_pulse": {"start": float(params.on_pulse[0]), "end": float(params.on_pulse[1])},
         "phase_axis": phase_slice.tolist(),
-        "num_pulses": int(data.shape[0]),
+        "num_pulses": int(params.num_pulses),
         "dataset": payload_dataset,
     }
