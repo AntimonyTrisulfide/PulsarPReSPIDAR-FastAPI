@@ -1,13 +1,16 @@
 import numpy as np
-import matplotlib.pyplot as plt
-from scipy.stats import iqr
-from matplotlib.gridspec import GridSpec
-from matplotlib.ticker import MaxNLocator
 from dataclasses import dataclass
 
 DEBIAS_THRESHOLD = 1.57
 EPSILON = 1e-6
 STOKES_LABELS = ("I", "Q", "U", "V")
+
+
+def _iqr(values):
+    if len(values) == 0:
+        return 0.0
+    q75, q25 = np.percentile(values, [75, 25])
+    return q75 - q25
 
 
 @dataclass(slots=True)
@@ -517,7 +520,7 @@ def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phas
     quantity_names = ["P/I", "L/I", "|V/I|", "V/I", "PA [deg]", "EA [deg]"]
 
     def compute_bin_count(values):
-        val_iqr = iqr(values)
+        val_iqr = _iqr(values)
         if val_iqr > 0:
             bin_width = 2 * val_iqr / (len(values) ** (1 / 3))
             range_ = np.ptp(values)
@@ -533,6 +536,9 @@ def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phas
             "quantities": [],
         }
     else:
+        import matplotlib.pyplot as plt
+        from matplotlib.ticker import MaxNLocator
+
         fig, axs = plt.subplots(len(quantities), len(phase_bins), figsize=(20, 15), constrained_layout=True)
 
     for row_idx, (quantity, name) in enumerate(zip(quantities, quantity_names)):
