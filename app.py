@@ -8,8 +8,10 @@ from test import plot_poincare_aitoff_at_phase, return_xyz_interactive_poincare_
 from test import get_all_profiles
 from test import plot_all_heatmaps
 from test import (
+    phase_slice_histogram_single,
     plot_phase_slice_histograms_by_phase,
     polarisation_histogram_single,
+    polarisation_stack_single,
     build_polarisation_payload,
     precompute_polarimetry,
     precompute_stokes,
@@ -409,11 +411,40 @@ async def phase_slice_histograms(
     return JSONResponse(content=payload)
 
 
+@app.post("/phase_slice_histogram", summary="Single phase-slice histogram for one polarisation quantity")
+async def phase_slice_histogram_endpoint(
+    quantity: str,
+    file: UploadFile | None = File(None),
+    left_phase: float = 0.0,
+    mid_phase: float = 0.5,
+    right_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    default_bins: int = 200,
+    data_key: str | None = None,
+):
+    on_pulse = (on_pulse_start, on_pulse_end)
+    precomputed, _ = await load_polarimetry_precompute(file=file, on_pulse=on_pulse, data_key=data_key)
+    payload = await asyncio.to_thread(
+        phase_slice_histogram_single,
+        precomputed,
+        left_phase,
+        mid_phase,
+        right_phase,
+        on_pulse,
+        _resolve_obs_id(file, data_key),
+        quantity,
+        default_bins,
+    )
+
+    return JSONResponse(content=payload)
+
+
 @app.post(
-    "/polarisation_preprocess",
+    "/polarisation_params",
     summary="Preprocess Poincare-sphere coords and polarisation fractions/angles",
 )
-async def polarisation_preprocess(
+async def polarisation_params(
     file: UploadFile | None = File(None),
     start_phase: float = 0.0,
     end_phase: float = 1.0,
@@ -485,4 +516,29 @@ async def polarisation_stacks_endpoint(
         ),
         media_type="application/json",
     )
+
+
+@app.post("/polarisation_stack", summary="Pulse-phase stack for one polarisation quantity")
+async def polarisation_stack_endpoint(
+    quantity: str,
+    file: UploadFile | None = File(None),
+    start_phase: float = 0.0,
+    end_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    data_key: str | None = None,
+):
+    on_pulse = (on_pulse_start, on_pulse_end)
+    precomputed, _ = await load_polarimetry_precompute(file=file, on_pulse=on_pulse, data_key=data_key)
+    payload = await asyncio.to_thread(
+        polarisation_stack_single,
+        precomputed,
+        start_phase,
+        end_phase,
+        on_pulse,
+        _resolve_obs_id(file, data_key),
+        quantity,
+    )
+
+    return JSONResponse(content=payload)
 

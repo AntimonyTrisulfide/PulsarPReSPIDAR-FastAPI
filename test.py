@@ -5,6 +5,30 @@ from dataclasses import dataclass
 DEBIAS_THRESHOLD = 1.57
 EPSILON = 1e-6
 STOKES_LABELS = ("I", "Q", "U", "V")
+PHASE_SLICE_QUANTITY_KEYS = ("P/I", "L/I", "|V/I|", "V/I", "PA", "EA")
+POLARISATION_STACK_KEYS = ("PA", "EA", "P/I", "L/I", "|V/I|", "V/I")
+
+
+def _phase_slice_quantity_specs(params):
+    return {
+        "P/I": (params.p_frac, "P/I"),
+        "L/I": (params.l_frac, "L/I"),
+        "|V/I|": (params.abs_vfrac, "|V/I|"),
+        "V/I": (params.v_frac, "V/I"),
+        "PA": (params.PA_deg, "PA [deg]"),
+        "EA": (params.EA_deg, "EA [deg]"),
+    }
+
+
+def _polarisation_stack_specs(params):
+    return {
+        "PA": (params.PA_deg, "PA [deg]"),
+        "EA": (params.EA_deg, "EA [deg]"),
+        "P/I": (params.p_frac, "P/I"),
+        "L/I": (params.l_frac, "L/I"),
+        "|V/I|": (params.abs_vfrac, "|V/I|"),
+        "V/I": (params.v_frac, "V/I"),
+    }
 
 
 def _iqr(values):
@@ -509,6 +533,72 @@ def plot_poincare_aitoff_at_phase(data, on_pulse, cphase, obs_id):
 
     return lon, lat
 
+
+def phase_slice_histogram_single(data, left_phase, mid_phase, right_phase, on_pulse, obs_id, quantity_key, default_bins=200):
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
+    num_pulses = params.num_pulses
+    specs = _phase_slice_quantity_specs(params)
+
+    if quantity_key not in specs:
+        return {"error": f"Unknown quantity {quantity_key}"}
+
+    quantity, name = specs[quantity_key]
+    phase_values = [left_phase, mid_phase, right_phase]
+    phase_bins = [np.argmin(np.abs(phase_axis - val)) for val in phase_values]
+
+    def compute_bin_count(values):
+        val_iqr = _iqr(values)
+        if val_iqr > 0:
+            bin_width = 2 * val_iqr / (len(values) ** (1 / 3))
+            range_ = np.ptp(values)
+            return int(np.clip(range_ / bin_width if bin_width else default_bins, 20, 300))
+        return default_bins
+
+    phase_entries = []
+    for phase_bin, phase_val in zip(phase_bins, phase_values):
+        values = quantity[:, phase_bin]
+        bin_count = compute_bin_count(values)
+        vmin = float(values.min())
+        vmax = float(values.max())
+        if vmin == vmax:
+            pad = max(abs(vmin) * 0.1, 0.5)
+            vmin -= pad
+            vmax += pad
+
+        counts, edges = np.histogram(values, bins=bin_count, range=(vmin, vmax))
+        x_limits = None
+        if quantity_key in {"P/I", "L/I", "|V/I|"}:
+            x_limits = [0.0, 1.0]
+        elif quantity_key == "V/I":
+            x_limits = [-1.0, 1.0]
+
+        phase_entries.append({
+            "phase_value": float(phase_val),
+            "phase_bin_index": int(phase_bin),
+            "bin_edges": edges.tolist(),
+            "counts": counts.tolist(),
+            "x_limits": x_limits,
+            "stats": {
+                "min": vmin,
+                "max": vmax,
+                "mean": float(values.mean()),
+                "std": float(values.std()),
+                "num_pulses": int(num_pulses),
+            },
+        })
+
+    return {
+        "obs_id": obs_id,
+        "phase_values": [float(p) for p in phase_values],
+        "phase_bins": [int(p) for p in phase_bins],
+        "quantity": {
+            "key": quantity_key,
+            "name": name,
+            "phase_slices": phase_entries,
+        },
+    }
+
 def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phase, on_pulse, obs_id, default_bins=200, return_data=False):
     params = _as_polarimetry_precompute(data, on_pulse)
     phase_axis = params.phase_axis
@@ -517,8 +607,8 @@ def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phas
     phase_values = [left_phase, mid_phase, right_phase]
     phase_bins = [np.argmin(np.abs(phase_axis - val)) for val in phase_values]
 
-    quantities = [params.p_frac, params.l_frac, params.abs_vfrac, params.v_frac, params.PA_deg, params.EA_deg]
-    quantity_names = ["P/I", "L/I", "|V/I|", "V/I", "PA [deg]", "EA [deg]"]
+    quantity_specs = _phase_slice_quantity_specs(params)
+    quantity_items = [(key, *quantity_specs[key]) for key in PHASE_SLICE_QUANTITY_KEYS]
 
     def compute_bin_count(values):
         val_iqr = _iqr(values)
@@ -540,9 +630,9 @@ def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phas
         import matplotlib.pyplot as plt
         from matplotlib.ticker import MaxNLocator
 
-        fig, axs = plt.subplots(len(quantities), len(phase_bins), figsize=(20, 15), constrained_layout=True)
+        fig, axs = plt.subplots(len(quantity_items), len(phase_bins), figsize=(20, 15), constrained_layout=True)
 
-    for row_idx, (quantity, name) in enumerate(zip(quantities, quantity_names)):
+    for row_idx, (quantity_key, quantity, name) in enumerate(quantity_items):
         phase_entries = []
         for col_idx, (phase_bin, phase_val) in enumerate(zip(phase_bins, phase_values)):
             values = quantity[:, phase_bin]
@@ -557,9 +647,9 @@ def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phas
             if return_data:
                 counts, edges = np.histogram(values, bins=bin_count, range=(vmin, vmax))
                 x_limits = None
-                if row_idx < 3:
+                if quantity_key in {"P/I", "L/I", "|V/I|"}:
                     x_limits = [0.0, 1.0]
-                elif row_idx == 3:
+                elif quantity_key == "V/I":
                     x_limits = [-1.0, 1.0]
 
                 phase_entries.append({
@@ -585,13 +675,14 @@ def plot_phase_slice_histograms_by_phase(data, left_phase, mid_phase, right_phas
             ax.set_xlabel("Value")
             ax.set_ylabel("Count")
 
-            if row_idx < 3:
+            if quantity_key in {"P/I", "L/I", "|V/I|"}:
                 ax.set_xlim(0, 1)
-            if row_idx == 3:
+            if quantity_key == "V/I":
                 ax.set_xlim(-1, 1)
 
         if return_data:
             result["quantities"].append({
+                "key": quantity_key,
                 "name": name,
                 "phase_slices": phase_entries,
             })
@@ -703,8 +794,7 @@ def plot_polarisation_stacks(data, start_phase, end_phase, on_pulse, obs_id, ret
     params = _as_polarimetry_precompute(data, on_pulse)
     phase_axis = params.phase_axis
     num_pulses = params.num_pulses
-    quantities = [params.PA_deg, params.EA_deg, params.p_frac, params.l_frac, params.abs_vfrac, params.v_frac]
-    labels = ["PA [deg]", "EA [deg]", "P/I", "L/I", "|V/I|", "V/I"]
+    quantity_specs = _polarisation_stack_specs(params)
 
     start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase)
     selected_phase_axis = phase_axis[start_idx:end_idx]
@@ -722,7 +812,8 @@ def plot_polarisation_stacks(data, start_phase, end_phase, on_pulse, obs_id, ret
         }
     
     if return_data:
-        for idx, (quantity, label) in enumerate(zip(quantities, labels)):
+        for quantity_key in POLARISATION_STACK_KEYS:
+            quantity, label = quantity_specs[quantity_key]
             q = quantity[:, start_idx:end_idx]
             q_min, q_max = np.nanmin(q), np.nanmax(q)
             if q_min == q_max:
@@ -731,12 +822,53 @@ def plot_polarisation_stacks(data, start_phase, end_phase, on_pulse, obs_id, ret
                 q_max += pad
 
             payload["quantities"].append({
+                "key": quantity_key,
                 "name": label,
                 "data": q.tolist(),
                 "vmin": float(q_min),
                 "vmax": float(q_max),
             })
         return payload
+
+
+def polarisation_stack_single(data, start_phase, end_phase, on_pulse, obs_id, quantity_key):
+    params = _as_polarimetry_precompute(data, on_pulse)
+    phase_axis = params.phase_axis
+    quantity_specs = _polarisation_stack_specs(params)
+
+    if quantity_key not in quantity_specs:
+        return {"error": f"Unknown quantity {quantity_key}"}
+
+    start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase)
+    selected_phase_axis = phase_axis[start_idx:end_idx]
+    quantity, label = quantity_specs[quantity_key]
+    q = quantity[:, start_idx:end_idx]
+    if q.size:
+        q_min = float(np.nanmin(q))
+        q_max = float(np.nanmax(q))
+    else:
+        q_min, q_max = 0.0, 1.0
+    if np.isfinite(q_min) and np.isfinite(q_max) and q_min == q_max:
+        pad = max(abs(q_min) * 0.1, 1e-3)
+        q_min -= pad
+        q_max += pad
+
+    default_start, default_end = params.on_pulse
+    return {
+        "obs_id": obs_id,
+        "start_phase": float(start_phase),
+        "end_phase": float(end_phase),
+        "on_pulse": {"start": float(default_start), "end": float(default_end)},
+        "phase_axis": selected_phase_axis.tolist(),
+        "pulse_number": params.pulse_number.tolist(),
+        "quantity": {
+            "key": quantity_key,
+            "name": label,
+            "data": q.tolist(),
+            "vmin": q_min,
+            "vmax": q_max,
+        },
+    }
 
 
 def _json_row(row):
@@ -765,8 +897,7 @@ def _json_dumps(value):
 def iter_polarisation_stacks_json(data, start_phase, end_phase, on_pulse, obs_id):
     params = _as_polarimetry_precompute(data, on_pulse)
     phase_axis = params.phase_axis
-    quantities = [params.PA_deg, params.EA_deg, params.p_frac, params.l_frac, params.abs_vfrac, params.v_frac]
-    labels = ["PA [deg]", "EA [deg]", "P/I", "L/I", "|V/I|", "V/I"]
+    quantity_specs = _polarisation_stack_specs(params)
 
     start_idx, end_idx = _phase_bounds(phase_axis, start_phase, end_phase)
     selected_phase_axis = phase_axis[start_idx:end_idx]
@@ -781,7 +912,8 @@ def iter_polarisation_stacks_json(data, start_phase, end_phase, on_pulse, obs_id
     yield f'"pulse_number":{_json_dumps(params.pulse_number.tolist())},'
     yield '"quantities":['
 
-    for quantity_index, (quantity, label) in enumerate(zip(quantities, labels)):
+    for quantity_index, quantity_key in enumerate(POLARISATION_STACK_KEYS):
+        quantity, label = quantity_specs[quantity_key]
         q = quantity[:, start_idx:end_idx]
         if q.size:
             q_min = float(np.nanmin(q))
@@ -796,6 +928,7 @@ def iter_polarisation_stacks_json(data, start_phase, end_phase, on_pulse, obs_id
         if quantity_index:
             yield ","
         yield "{"
+        yield f'"key":{_json_dumps(quantity_key)},'
         yield f'"name":{_json_dumps(label)},'
         yield '"data":['
         for row_index, row in enumerate(q):
