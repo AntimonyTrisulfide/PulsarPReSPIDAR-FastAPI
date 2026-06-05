@@ -1,4 +1,4 @@
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, Request
 from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 import io
@@ -25,6 +25,9 @@ import threading
 from collections import OrderedDict
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import ProcessCollector
+from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
+from urllib.request import Request as UrlRequest, urlopen
 
 try:
     ProcessCollector()
@@ -34,12 +37,32 @@ except ValueError:
 
 app = FastAPI(title="Pulsar Polarimetry API")
 
+MEERTIME_HOST = "psrweb.jb.man.ac.uk"
+MEERTIME_PATH_PREFIX = "/meertime/singlepulse/"
+MEERTIME_ALLOWED_SUFFIXES = (".npz", "/pipeline_info.json")
+MEERTIME_CHUNK_SIZE = 1024 * 1024
+
 # Instrument the app for Prometheus metrics
 Instrumentator().instrument(app).expose(app)
 
+def _get_cors_origins():
+    default_origins = [
+        "https://pulsar-p-re-spidar-react-js.vercel.app",
+        "https://psrweb.jb.man.ac.uk",
+        "http://localhost:5173",
+        "http://localhost:4173",
+    ]
+    configured_origins = [
+        origin.strip()
+        for origin in os.getenv("CORS_ALLOWED_ORIGINS", "").split(",")
+        if origin.strip()
+    ]
+    return default_origins + configured_origins
+
+
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["https://pulsar-p-re-spidar-react-js.vercel.app", "https://psrweb.jb.man.ac.uk", "http://localhost:5173"],  # Or specify your frontend URL
+    allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
@@ -239,9 +262,75 @@ def _process_handle_count(process):
         return None
 
 
+def _is_allowed_meertime_url(raw_url):
+    parsed = urlparse(raw_url)
+    if parsed.scheme not in ("http", "https"):
+        return False
+    if parsed.netloc.lower() != MEERTIME_HOST:
+        return False
+    if not parsed.path.startswith(MEERTIME_PATH_PREFIX):
+        return False
+    return parsed.path.endswith(MEERTIME_ALLOWED_SUFFIXES)
+
+
+def _iter_upstream_chunks(upstream):
+    try:
+        while True:
+            chunk = upstream.read(MEERTIME_CHUNK_SIZE)
+            if not chunk:
+                break
+            yield chunk
+    finally:
+        upstream.close()
+
+
+def _stream_meertime_response(upstream):
+    content_type = upstream.headers.get("content-type") or "application/octet-stream"
+    status_code = getattr(upstream, "status", getattr(upstream, "code", 200))
+    return StreamingResponse(
+        _iter_upstream_chunks(upstream),
+        status_code=status_code,
+        media_type=content_type,
+        headers={"Cache-Control": "no-store"},
+    )
+
+
 @app.get("/", summary="Health check")
 async def root() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/meertime-proxy", summary="Proxy allowed MeerTime files")
+async def meertime_proxy(request: Request, url: str | None = None):
+    if not url:
+        raise HTTPException(status_code=400, detail="Missing url query parameter")
+
+    try:
+        is_allowed = _is_allowed_meertime_url(url)
+    except ValueError:
+        is_allowed = False
+
+    if not is_allowed:
+        raise HTTPException(
+            status_code=400,
+            detail="Only MeerTime .npz and pipeline_info.json files are allowed",
+        )
+
+    upstream_headers = {}
+    authorization = request.headers.get("authorization")
+    if authorization:
+        upstream_headers["Authorization"] = authorization
+
+    upstream_request = UrlRequest(url, headers=upstream_headers)
+    try:
+        upstream = await asyncio.to_thread(urlopen, upstream_request, timeout=60)
+    except HTTPError as error:
+        return _stream_meertime_response(error)
+    except (OSError, TimeoutError, URLError) as error:
+        print("MeerTime proxy request failed:", error)
+        raise HTTPException(status_code=502, detail="MeerTime proxy request failed") from error
+
+    return _stream_meertime_response(upstream)
 
 @app.get("/stats", summary="Get app process stats")
 async def get_stats():
@@ -451,10 +540,16 @@ async def polarisation_params(
     on_pulse_start: float = 0.0,
     on_pulse_end: float = 1.0,
     max_pulses: int | None = None,
+    pulse_index: int | None = None,
     data_key: str | None = None,
 ):
     on_pulse = (on_pulse_start, on_pulse_end)
     precomputed, _ = await load_polarimetry_precompute(file=file, on_pulse=on_pulse, data_key=data_key)
+    if pulse_index is not None and (pulse_index < 0 or pulse_index > precomputed.num_pulses):
+        raise HTTPException(
+            status_code=400,
+            detail=f"pulse_index must be between 0 and {precomputed.num_pulses}; 0 is the integrated profile",
+        )
     payload = await asyncio.to_thread(
         build_polarisation_payload,
         precomputed,
@@ -462,6 +557,7 @@ async def polarisation_params(
         end_phase,
         on_pulse,
         max_pulses,
+        pulse_index,
     )
 
     return JSONResponse(content=payload)

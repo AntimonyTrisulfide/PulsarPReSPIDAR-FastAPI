@@ -1087,7 +1087,7 @@ def get_pulse_parameters(dataset, pulse_index):
     return dataset[pulse_index]
 
 
-def build_polarisation_payload(data, start_phase, end_phase, on_pulse, max_pulses=None):
+def build_polarisation_payload(data, start_phase, end_phase, on_pulse, max_pulses=None, pulse_index=None):
     def _tolist_with_none(arr):
         # Replace NaN/inf with None for valid JSON serialization
         return np.where(np.isfinite(arr), arr, None).tolist()
@@ -1112,8 +1112,11 @@ def build_polarisation_payload(data, start_phase, end_phase, on_pulse, max_pulse
     phase_slice = phase_axis[start_idx:end_idx]
     total_subpulses = params.num_pulses
 
-    # Determine which pulse indices to include
-    if max_pulses is None:
+    # Determine which pulse indices to include. 0 is the integrated profile;
+    # 1..num_pulses are individual subpulses.
+    if pulse_index is not None:
+        indices = [int(pulse_index)]
+    elif max_pulses is None:
         indices = range(total_subpulses + 1)
     else:
         max_pulses = max(0, min(int(max_pulses), total_subpulses))
