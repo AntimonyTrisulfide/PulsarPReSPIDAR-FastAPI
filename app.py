@@ -1,3 +1,5 @@
+from urllib import request
+
 from fastapi import FastAPI, HTTPException, Request
 from fastapi import UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
@@ -322,9 +324,21 @@ async def meertime_proxy(request: Request, url: str | None = None):
         )
 
     upstream_headers = {}
-    authorization = request.headers.get("authorization")
+
+    authorization = (
+        request.headers.get("x-upstream-authorization")
+        or request.headers.get("x-meertime-authorization")
+        or request.headers.get("authorization")
+    )
+
     if authorization:
         upstream_headers["Authorization"] = authorization
+
+    print("Incoming headers:")
+    print(dict(request.headers))
+
+    print("Using auth:")
+    print(repr(authorization))
 
     upstream_request = UrlRequest(url, headers=upstream_headers)
     try:
