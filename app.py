@@ -65,7 +65,12 @@ app.add_middleware(
     allow_origins=_get_cors_origins(),
     allow_credentials=True,
     allow_methods=["*"],
-    allow_headers=["*"],
+    allow_headers=[
+        "Authorization",
+        "Content-Type",
+        "X-Upstream-Authorization",
+        "X-MeerTime-Authorization",
+    ],
 )
 
 MAX_CACHE_ITEMS = max(1, int(os.getenv("MAX_CACHE_ITEMS", "1")))
