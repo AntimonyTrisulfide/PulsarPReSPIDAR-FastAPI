@@ -28,7 +28,7 @@ from collections import OrderedDict
 from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import ProcessCollector
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlparse
+from urllib.parse import quote, unquote, urlparse, urlunparse
 from urllib.request import Request as UrlRequest, urlopen
 
 try:
