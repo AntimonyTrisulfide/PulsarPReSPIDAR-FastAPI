@@ -310,7 +310,10 @@ async def root() -> dict[str, str]:
 @app.get("/meertime-proxy", summary="Proxy allowed MeerTime files")
 async def meertime_proxy(request: Request, url: str | None = None):
     if not url:
-        raise HTTPException(status_code=400, detail="Missing url query parameter")
+        raise HTTPException(
+            status_code=400,
+            detail="Missing url query parameter",
+        )
 
     try:
         is_allowed = _is_allowed_meertime_url(url)
@@ -323,31 +326,85 @@ async def meertime_proxy(request: Request, url: str | None = None):
             detail="Only MeerTime .npz and pipeline_info.json files are allowed",
         )
 
-    upstream_headers = {}
-
     authorization = (
         request.headers.get("x-upstream-authorization")
         or request.headers.get("x-meertime-authorization")
         or request.headers.get("authorization")
     )
 
-    if authorization:
-        upstream_headers["Authorization"] = authorization
+    if not authorization:
+        raise HTTPException(
+            status_code=401,
+            detail="Missing upstream authorization",
+        )
 
-    print("Incoming headers:")
-    print(dict(request.headers))
+    parsed = urlparse(url)
 
-    print("Using auth:")
-    print(repr(authorization))
+    # FastAPI decodes %3A in the query parameter. Re-encode the path before
+    # sending it to the MeerTime Apache server.
+    encoded_path = quote(
+        unquote(parsed.path),
+        safe="/",
+    )
 
-    upstream_request = UrlRequest(url, headers=upstream_headers)
+    upstream_url = urlunparse(
+        (
+            parsed.scheme,
+            parsed.netloc,
+            encoded_path,
+            parsed.params,
+            parsed.query,
+            "",
+        )
+    )
+
+    upstream_request = UrlRequest(
+        upstream_url,
+        headers={
+            "Authorization": authorization,
+            "Accept": "*/*",
+            "User-Agent": "MeerTime-FastAPI-Proxy/1.0",
+        },
+        method="GET",
+    )
+
     try:
-        upstream = await asyncio.to_thread(urlopen, upstream_request, timeout=60)
+        upstream = await asyncio.to_thread(
+            urlopen,
+            upstream_request,
+            timeout=60,
+        )
+
     except HTTPError as error:
-        return _stream_meertime_response(error)
+        body = error.read()
+
+        print(
+            f"MeerTime upstream HTTP error: "
+            f"status={error.code}, url={upstream_url}"
+        )
+
+        return StreamingResponse(
+            io.BytesIO(body),
+            status_code=error.code,
+            media_type=error.headers.get(
+                "content-type",
+                "application/octet-stream",
+            ),
+            headers={
+                "Cache-Control": "no-store",
+            },
+        )
+
     except (OSError, TimeoutError, URLError) as error:
-        print("MeerTime proxy request failed:", error)
-        raise HTTPException(status_code=502, detail="MeerTime proxy request failed") from error
+        print(
+            f"MeerTime proxy request failed: "
+            f"url={upstream_url}, error={error}"
+        )
+
+        raise HTTPException(
+            status_code=502,
+            detail="MeerTime proxy request failed",
+        ) from error
 
     return _stream_meertime_response(upstream)
 
