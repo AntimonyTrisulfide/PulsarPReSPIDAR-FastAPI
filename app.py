@@ -14,9 +14,11 @@ from test import (
     plot_phase_slice_histograms_by_phase,
     polarisation_histogram_single,
     polarisation_stack_single,
+    rvm_fit_payload,
     build_polarisation_payload,
     precompute_polarimetry,
     precompute_stokes,
+    total_intensity_evolution,
 )
 from test import iter_polarisation_stacks_json
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -52,7 +54,13 @@ def _get_cors_origins():
         "https://pulsar-p-re-spidar-react-js.vercel.app",
         "https://psrweb.jb.man.ac.uk",
         "http://localhost:5173",
+        "http://localhost:5174",
+        "http://localhost:5175",
         "http://localhost:4173",
+        "http://127.0.0.1:5173",
+        "http://127.0.0.1:5174",
+        "http://127.0.0.1:5175",
+        "http://127.0.0.1:4173",
     ]
     configured_origins = [
         origin.strip()
@@ -530,6 +538,30 @@ async def export_heatmaps(file: UploadFile | None = File(None), start_phase: flo
 
     return {label: _serialise_heatmap(heatmaps[label]) for label in ("I", "Q", "U", "V")}
 
+
+@app.post("/total_intensity_evolution", summary="Stokes-I single-pulse intensity evolution diagnostics")
+async def total_intensity_evolution_endpoint(
+    file: UploadFile | None = File(None),
+    start_phase: float = 0.0,
+    end_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    normalization: str = "mean_on",
+    data_key: str | None = None,
+):
+    on_pulse = (on_pulse_start, on_pulse_end)
+    precomputed, _ = await load_stokes_precompute(file=file, data_key=data_key)
+    payload = await asyncio.to_thread(
+        total_intensity_evolution,
+        precomputed,
+        start_phase,
+        end_phase,
+        on_pulse,
+        _resolve_obs_id(file, data_key),
+        normalization=normalization,
+    )
+    return JSONResponse(content=payload)
+
 @app.post("/poincare_sphere_aitoff_fixedphase", summary="Fetch Poincare sphere data for Aitoff projection with fixed phase value")
 async def poincare_sphere_aitoff_fixedphase(
     file: UploadFile | None = File(None),
@@ -541,11 +573,11 @@ async def poincare_sphere_aitoff_fixedphase(
 ):
     on_pulse = (on_pulse_start, on_pulse_end)
     precomputed, _ = await load_polarimetry_precompute(file=file, on_pulse=on_pulse, data_key=data_key)
-    lon_arr, lat_array = await asyncio.to_thread(
+    payload = await asyncio.to_thread(
         plot_poincare_aitoff_at_phase, precomputed, on_pulse, phase_value, obs_id or _resolve_obs_id(file, data_key)
     )
 
-    return {"lon": lon_arr.tolist(), "lat": lat_array.tolist()}
+    return {key: value.tolist() for key, value in payload.items()}
 
 
 @app.post("/phase_slice_histograms", summary="Phase-slice histograms for multiple polarisation quantities")
@@ -557,6 +589,7 @@ async def phase_slice_histograms(
     on_pulse_start: float = 0.0,
     on_pulse_end: float = 1.0,
     default_bins: int = 200,
+    sigma_threshold: float = 3.0,
     data_key: str | None = None,
 ):
     on_pulse = (on_pulse_start, on_pulse_end)
@@ -571,6 +604,7 @@ async def phase_slice_histograms(
         _resolve_obs_id(file, data_key),
         default_bins,
         True,
+        sigma_threshold,
     )
 
     return JSONResponse(content=payload)
@@ -586,6 +620,7 @@ async def phase_slice_histogram_endpoint(
     on_pulse_start: float = 0.0,
     on_pulse_end: float = 1.0,
     default_bins: int = 200,
+    sigma_threshold: float = 3.0,
     data_key: str | None = None,
 ):
     on_pulse = (on_pulse_start, on_pulse_end)
@@ -600,6 +635,7 @@ async def phase_slice_histogram_endpoint(
         _resolve_obs_id(file, data_key),
         quantity,
         default_bins,
+        sigma_threshold,
     )
 
     return JSONResponse(content=payload)
@@ -639,7 +675,7 @@ async def polarisation_params(
     return JSONResponse(content=payload)
 
 # One route that serves a single quantity; you can call it for each of the 8 quantities
-# quantity values: PA, EA, P/I, L/I, |V/I|, V/I, I, dPA
+# quantity values: PA, EA, P/I, L/I, |V/I|, V/I, I, Q, U, V
 @app.post("/polarisation_histogram", summary="Single polarisation histogram for one quantity")
 async def polarisation_histogram_single_endpoint(
     quantity: str,
@@ -649,6 +685,7 @@ async def polarisation_histogram_single_endpoint(
     on_pulse_start: float = 0.0,
     on_pulse_end: float = 1.0,
     base_quantity_bins: int = 200,
+    sigma_threshold: float = 3.0,
     data_key: str | None = None,
 ):
     on_pulse = (on_pulse_start, on_pulse_end)
@@ -662,6 +699,36 @@ async def polarisation_histogram_single_endpoint(
         _resolve_obs_id(file, data_key),
         quantity,
         base_quantity_bins,
+        sigma_threshold,
+    )
+
+    return JSONResponse(content=payload)
+
+
+@app.post("/rvm_fit", summary="RVM fit over empirical PA density histogram")
+async def rvm_fit_endpoint(
+    file: UploadFile | None = File(None),
+    start_phase: float = 0.0,
+    end_phase: float = 1.0,
+    on_pulse_start: float = 0.0,
+    on_pulse_end: float = 1.0,
+    phase_bins: int = 96,
+    pa_bins: int = 120,
+    sigma_threshold: float = 3.0,
+    data_key: str | None = None,
+):
+    on_pulse = (on_pulse_start, on_pulse_end)
+    precomputed, _ = await load_polarimetry_precompute(file=file, on_pulse=on_pulse, data_key=data_key)
+    payload = await asyncio.to_thread(
+        rvm_fit_payload,
+        precomputed,
+        start_phase,
+        end_phase,
+        on_pulse,
+        _resolve_obs_id(file, data_key),
+        phase_bins,
+        pa_bins,
+        sigma_threshold,
     )
 
     return JSONResponse(content=payload)
@@ -713,4 +780,3 @@ async def polarisation_stack_endpoint(
     )
 
     return JSONResponse(content=payload)
-
