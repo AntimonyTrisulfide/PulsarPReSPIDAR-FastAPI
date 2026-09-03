@@ -31,7 +31,7 @@ from prometheus_fastapi_instrumentator import Instrumentator
 from prometheus_client import ProcessCollector
 from urllib.error import HTTPError, URLError
 from urllib.parse import quote, unquote, urlparse, urlunparse
-from urllib.request import Request as UrlRequest, urlopen
+from urllib.request import Request as UrlRequest, build_opener, ProxyHandler
 
 try:
     ProcessCollector()
@@ -45,6 +45,7 @@ MEERTIME_HOST = "psrweb.jb.man.ac.uk"
 MEERTIME_PATH_PREFIX = "/meertime/singlepulse/"
 MEERTIME_ALLOWED_SUFFIXES = (".npz", "/pipeline_info.json")
 MEERTIME_CHUNK_SIZE = 1024 * 1024
+DIRECT_URL_OPENER = build_opener(ProxyHandler({}))
 
 # Instrument the app for Prometheus metrics
 Instrumentator().instrument(app).expose(app)
@@ -378,7 +379,7 @@ async def meertime_proxy(request: Request, url: str | None = None):
 
     try:
         upstream = await asyncio.to_thread(
-            urlopen,
+            DIRECT_URL_OPENER.open,
             upstream_request,
             timeout=60,
         )
